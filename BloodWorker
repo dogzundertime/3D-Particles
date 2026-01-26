@@ -1,1 +1,335 @@
+--!native
+--!strict
 
+local SharedTableRegistry = game:GetService("SharedTableRegistry")         --          sharedtable bridge between client main thread and actor workers
+
+local STATE_KEY = "_BLOOD_STATE_V1"                                       --          sharedtable registry key for the blood state blob
+
+local function clamp01(x: number): number                                 --          clamps a number into the 0..1 range (used for stable damping)
+	if x < 0 then return 0 end
+	if x > 1 then return 1 end
+	return x
+end
+
+local function waitForState(): any                                        --          waits until the client has created and set the sharedtable state
+	while true do
+		local ok, st = pcall(function()
+			return SharedTableRegistry:GetSharedTable(STATE_KEY)
+		end)
+		if ok and st then
+			return st
+		end
+		task.wait()
+	end
+end
+
+local BloodWorker = {}
+
+local function stepOne(                                                   --          advances one particle by dtStep, handling phase changes and surface constraints
+	phase: number,
+	dtStep: number,
+	gravityY: number,
+	surfaceOffset: number,
+	slideFriction: number,
+	stopSpeed2: number,
+	airSpinDamp: number,
+	groundSpinDamp: number,
+	px: number, py: number, pz: number,
+	vx: number, vy: number, vz: number,
+	lx: number, ly: number, lz: number,
+	nx: number, ny: number, nz: number,
+	ax: number, ay: number, az: number,
+	avx: number, avy: number, avz: number
+): (number, number, number, number, number, number, number, number, number, number, number, number, number)
+	if dtStep <= 0 then                                                     --          no time => no work
+		return phase, px, py, pz, vx, vy, vz, ax, ay, az, avx, avy, avz
+	end
+
+	if phase == 1 then                                                      --          phase 1 = airborne (free flight + gravity + spin damp)
+		vy += gravityY * dtStep                                              --          apply gravity acceleration to vertical velocity
+
+		px += vx * dtStep                                                    --          integrate position from velocity
+		py += vy * dtStep
+		pz += vz * dtStep
+
+		ax += avx * dtStep                                                   --          integrate euler angles from angular velocity
+		ay += avy * dtStep
+		az += avz * dtStep
+
+		local airMul = clamp01(1 - airSpinDamp * dtStep)                     --          exponential-ish damping factor for airborne spin
+		avx *= airMul
+		avy *= airMul
+		avz *= airMul
+
+		local dx = px - lx                                                   --          signed distance to last-known support plane along its normal
+		local dy = py - ly
+		local dz = pz - lz
+		local dist = dx*nx + dy*ny + dz*nz
+		local vn = vx*nx + vy*ny + vz*nz                                      --          velocity component along the plane normal
+
+		if dist <= surfaceOffset and vn <= 0 then                             --          crossing into the surface while moving toward it => land
+			local push = (dist - surfaceOffset)                               --          push out so we sit exactly at surface offset
+			px -= nx * push
+			py -= ny * push
+			pz -= nz * push
+
+			vx -= nx * vn                                                     --          remove normal component so we stick to the plane (no penetration)
+			vy -= ny * vn
+			vz -= nz * vn
+
+			vx *= 0.85                                                        --          soft energy loss on impact
+			vy *= 0.85
+			vz *= 0.85
+
+			ax = 0                                                            --          snap tilt when we hit a surface (keeps decal-like look)
+			az = 0
+			avx = 0
+			avz = 0
+
+			phase = 2                                                         --          transition to sliding phase
+		end
+
+	elseif phase == 2 then                                                  --          phase 2 = sliding on a surface plane (friction + constraint)
+		local slideMul = clamp01(1 - slideFriction * dtStep)                  --          friction multiplier applied each step
+		vx *= slideMul
+		vy *= slideMul
+		vz *= slideMul
+
+		px += vx * dtStep                                                    --          integrate position (still uses velocity, but constrained back onto plane)
+		py += vy * dtStep
+		pz += vz * dtStep
+
+		local dx = px - lx                                                   --          re-project back to plane to prevent drift off the surface
+		local dy = py - ly
+		local dz = pz - lz
+		local dist = dx*nx + dy*ny + dz*nz
+		local push = (dist - surfaceOffset)
+		px -= nx * push
+		py -= ny * push
+		pz -= nz * push
+
+		local gMul = clamp01(1 - groundSpinDamp * dtStep)                     --          stronger damping while on ground
+		ay += avy * dtStep                                                   --          allow yaw spin to decay over time
+		avy *= gMul
+
+		ax = 0                                                                --          keep roll/pitch locked while on ground
+		az = 0
+		avx = 0
+		avz = 0
+
+		local s2 = vx*vx + vy*vy + vz*vz                                      --          stop when speed is tiny (resting pool)
+		if s2 <= stopSpeed2 then
+			vx = 0; vy = 0; vz = 0
+			phase = 3                                                         --          phase 3 = resting
+		end
+
+	else                                                                    --          phase 3 = resting (only yaw spin can slowly settle)
+		local gMul = clamp01(1 - groundSpinDamp * dtStep)
+		ay += avy * dtStep
+		avy *= gMul
+
+		ax = 0
+		az = 0
+		avx = 0
+		avz = 0
+	end
+
+	return phase, px, py, pz, vx, vy, vz, ax, ay, az, avx, avy, avz          --          return updated state so caller can write back once
+end
+
+function BloodWorker.Attach(actor: Actor)                                  --          called once per actor; binds message handler that processes particle slices
+	local st = waitForState()                                              --          sharedtable state is authored by the client and read/written by workers
+
+	actor:BindToMessage("Step", function(payload)                           --          payload contains dt, indices slice, and current config constants
+		task.desynchronize()                                                 --          move this work off the main scheduler lane (actor parallelism)
+
+		local dt = payload.dt :: number                                      --          fixed-ish step dt decided by the client tick logic
+		local indices = payload.indices :: { number }                         --          list of particle indices this worker owns this frame
+
+		local gravityY = payload.gravityY :: number                          --          gravity acceleration (negative y)
+		local lifetime = payload.lifetime :: number                          --          max age until despawn
+
+		local surfaceOffset = payload.surfaceOffset :: number                --          how far above the surface plane we keep the particle
+		local slideFriction = payload.slideFriction :: number                --          friction applied in phase 2
+		local stopSpeed = payload.stopSpeed :: number                        --          threshold for phase 2 -> phase 3
+		local stopSpeed2 = stopSpeed * stopSpeed
+
+		local airSpinDamp = payload.airSpinDamp :: number                    --          spin damping while airborne
+		local groundSpinDamp = payload.groundSpinDamp :: number              --          spin damping while grounded
+
+		local ceilingNormalYMin = payload.ceilingNormalYMin :: number        --          ceiling test: nY <= -min => treat as underside
+		local ceilingBounce = payload.ceilingBounce :: number                --          restitution for ceiling bounces
+
+		for _, idx in ipairs(indices) do                                      --          iterate the worker slice
+			if st.active[idx] ~= 1 then                                       --          skip dead slots (keeps loop tight)
+				continue
+			end
+
+			local age = (st.age[idx] :: number) + dt                          --          age accumulation
+			st.age[idx] = age
+			if age >= lifetime then                                           --          lifetime expiry => mark slot free
+				st.active[idx] = 0
+				st.phase[idx] = 0
+				st.wall[idx] = 0
+				st.wallt[idx] = 0
+				continue
+			end
+
+			local phase = st.phase[idx] :: number                             --          current motion phase
+
+			if phase == 2 and (st.support[idx] :: number) == 0 then           --          if we were sliding but lost support, fall back to airborne
+				phase = 1
+			end
+
+			local px = st.px[idx] :: number
+			local py = st.py[idx] :: number
+			local pz = st.pz[idx] :: number
+
+			local vx = st.vx[idx] :: number
+			local vy = st.vy[idx] :: number
+			local vz = st.vz[idx] :: number
+
+			local lx = st.lx[idx] :: number                                   --          last support hit position
+			local ly = st.ly[idx] :: number
+			local lz = st.lz[idx] :: number
+
+			local nx = st.nx[idx] :: number                                   --          last support plane normal
+			local ny = st.ny[idx] :: number
+			local nz = st.nz[idx] :: number
+
+			local ax = st.ax[idx] :: number                                   --          euler angles
+			local ay = st.ay[idx] :: number
+			local az = st.az[idx] :: number
+
+			local avx = st.avx[idx] :: number                                 --          angular velocities
+			local avy = st.avy[idx] :: number
+			local avz = st.avz[idx] :: number
+
+			if (st.wall[idx] :: number) == 1 then                             --          a wall/ceiling sweep predicted a contact during this dt
+				local t = clamp01(st.wallt[idx] :: number)                    --          time-of-impact fraction in [0..1]
+				local dtHit = dt * t                                           --          step up to contact
+				local dtRem = dt - dtHit                                       --          remainder after contact
+
+				if dtHit > 0 then                                              --          integrate until we reach the contact point
+					phase, px, py, pz, vx, vy, vz, ax, ay, az, avx, avy, avz =
+						stepOne(
+							phase, dtHit,
+							gravityY,
+							surfaceOffset,
+							slideFriction,
+							stopSpeed2,
+							airSpinDamp,
+							groundSpinDamp,
+							px, py, pz,
+							vx, vy, vz,
+							lx, ly, lz,
+							nx, ny, nz,
+							ax, ay, az,
+							avx, avy, avz
+						)
+				end
+
+				px = st.wallx[idx] :: number                                   --          snap to the contact position chosen by the client sweep
+				py = st.wally[idx] :: number
+				pz = st.wallz[idx] :: number
+
+				local wnx = st.wallnx[idx] :: number                           --          contact normal from sweep
+				local wny = st.wallny[idx] :: number
+				local wnz = st.wallnz[idx] :: number
+
+				local vn = vx*wnx + vy*wny + vz*wnz                             --          current velocity along the contact normal
+				if vn < 0 then                                                 --          only resolve if moving into the surface
+					local isCeil = (phase == 1) and (wny <= -ceilingNormalYMin) --          ceiling resolution only when airborne
+					if isCeil then
+						local e = ceilingBounce                                --          restitution for bounce
+						local k = (1 + e) * vn                                  --          impulse scalar for reflection
+						vx -= wnx * k
+						vy -= wny * k
+						vz -= wnz * k
+
+						vx *= 0.92                                              --          mild energy loss
+						vy *= 0.92
+						vz *= 0.92
+					else
+						vx -= wnx * vn                                          --          remove normal component (slide along wall)
+						vy -= wny * vn
+						vz -= wnz * vn
+
+						if phase == 1 then                                      --          airborne wall hit => kill horizontal to reduce “skating” past walls
+							vx = 0
+							vz = 0
+						else                                                    --          grounded wall hit => stronger damping and kill tilt
+							vx *= 0.65
+							vy *= 0.65
+							vz *= 0.65
+
+							ax = 0
+							az = 0
+							avx = 0
+							avz = 0
+						end
+					end
+				end
+
+				st.wall[idx] = 0                                                --          clear sweep flag so client can set it again next frame
+				st.wallt[idx] = 0
+
+				if dtRem > 0 then                                              --          integrate remaining time after collision response
+					phase, px, py, pz, vx, vy, vz, ax, ay, az, avx, avy, avz =
+						stepOne(
+							phase, dtRem,
+							gravityY,
+							surfaceOffset,
+							slideFriction,
+							stopSpeed2,
+							airSpinDamp,
+							groundSpinDamp,
+							px, py, pz,
+							vx, vy, vz,
+							lx, ly, lz,
+							nx, ny, nz,
+							ax, ay, az,
+							avx, avy, avz
+						)
+				end
+			else
+				phase, px, py, pz, vx, vy, vz, ax, ay, az, avx, avy, avz =      --          normal step with no sweep contact this frame
+					stepOne(
+						phase, dt,
+						gravityY,
+						surfaceOffset,
+						slideFriction,
+						stopSpeed2,
+						airSpinDamp,
+						groundSpinDamp,
+						px, py, pz,
+						vx, vy, vz,
+						lx, ly, lz,
+						nx, ny, nz,
+						ax, ay, az,
+						avx, avy, avz
+					)
+			end
+
+			st.phase[idx] = phase                                              --          write back to sharedtable (single writeback per field per idx)
+
+			st.px[idx] = px
+			st.py[idx] = py
+			st.pz[idx] = pz
+
+			st.vx[idx] = vx
+			st.vy[idx] = vy
+			st.vz[idx] = vz
+
+			st.ax[idx] = ax
+			st.ay[idx] = ay
+			st.az[idx] = az
+
+			st.avx[idx] = avx
+			st.avy[idx] = avy
+			st.avz[idx] = avz
+		end
+	end)
+end
+
+return BloodWorker
