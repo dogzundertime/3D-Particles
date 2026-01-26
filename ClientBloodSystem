@@ -1,0 +1,984 @@
+--!native
+--!strict
+
+local Players = game:GetService("Players")                                
+local ReplicatedStorage = game:GetService("ReplicatedStorage")             
+local RunService = game:GetService("RunService")                          
+local SharedTableRegistry = game:GetService("SharedTableRegistry")         --          sharedtable registry for state sharing
+local Workspace = game:GetService("Workspace")                            
+
+export type Config = {                                                     --          config is copied once into the system and treated as read-only afterward
+	PoolSize: number,
+	Lifetime: number,
+
+	SpawnMin: number,
+	SpawnMax: number,
+
+	WorkersFolderName: string,
+	WorkersCloneParent: Instance?,                                          --          default: playerscripts
+
+	PhysicsHz: number,                                                      --          tick rate for visible particles
+	HiddenPhysicsHz: number,                                                --          tick rate for offscreen particles
+	RestPhysicsHz: number,                                                  --          tick rate for resting particles
+	CullHz: number,                                                        --          visibility refresh rate
+
+	MaxDrawDistance: number,
+
+	GravityY: number,
+
+	ArchUpMin: number,
+	ArchUpMax: number,
+	ArchOutMin: number,
+	ArchOutMax: number,
+
+	AirSpinDamp: number,
+	GroundSpinDamp: number,
+
+	SlideFriction: number,
+	StopSpeed: number,
+
+	SurfaceOffset: number,
+	RaycastUp: number,
+	RaycastDown: number,
+
+	Template: BasePart?,
+	FolderName: string,
+
+	-- support refresh (edge falling)                                       --          refreshes the support plane so splats can fall off edges
+	SupportHz: number,
+	SupportUp: number,
+	SupportDown: number,
+	SupportEps: number,
+
+	-- wall/ceiling sweep                                                   --          budgeted sweeps prevent tunneling through thin walls at high speed
+	WallPad: number,
+	WallMaxLen: number,
+	WallNormalYMax: number,                                                 --          abs(ny) < this => treat as side wall
+	CeilingNormalYMin: number,                                              --          ny <= -this => treat as ceiling/underside (airborne only)
+	CeilingBounce: number,                                                  --          restitution 0..1
+
+	CollisionRadius: number,                                                --          used for spawn occupancy checks and sweep toi adjustment
+
+	-- performance budgets                                                  --          caps main-thread raycasts per visible physics tick
+	MaxAirRaycasts: number,
+	MaxSlideRaycasts: number,
+}
+
+type BloodSystem = {                                                       --          internal runtime state for the system instance
+	Config: Config,
+	Initialized: boolean,
+
+	_state: any,                                                            --          sharedtable state
+	_parts: { BasePart },                                                   --          pooled parts indexed by slot id
+	_visible: { [number]: boolean },                                        --          current visibility flag per slot
+	_activeList: { number },                                                --          dense list of active indices for fast iteration
+	_activePos: { [number]: number },                                       --          index -> position inside _activeList (for swap-remove)
+	_free: { number },                                                      --          stack of free indices
+
+	_folder: Folder?,
+
+	_actors: { Actor },                                                     --          cloned actors used for stepping in parallel
+	_conn: RBXScriptConnection?,
+
+	_map: Instance?,
+	_rp: RaycastParams?,
+	_op: OverlapParams?,
+}
+
+local ClientBloodSystem = {}
+ClientBloodSystem.__index = ClientBloodSystem
+
+local STATE_KEY = "_BLOOD_STATE_V1"                                       --          sharedtable registry key (must match worker)
+
+local function nowCamera(): Camera?                                       --          camera can swap on respawn; always query current
+	return Workspace.CurrentCamera
+end
+
+local function ensureFolder(sys: BloodSystem): Folder                      --          ensures the render folder exists and is parented to camera for cheap culling
+	if sys._folder and sys._folder.Parent ~= nil then
+		return sys._folder
+	end
+
+	local f = Instance.new("Folder")
+	f.Name = sys.Config.FolderName
+
+	local cam = nowCamera()
+	if cam then
+		f.Parent = cam                                                      --          parent to camera to keep hierarchy small and easy to manage
+	else
+		f.Parent = Workspace
+	end
+
+	sys._folder = f
+	return f
+end
+
+local function makePartFromTemplate(sys: BloodSystem): BasePart             --          creates a pooled part (clone if template provided)
+	local template = sys.Config.Template
+	local p: BasePart
+
+	if template then
+		p = template:Clone()
+	else
+		local part = Instance.new("Part")
+		part.Size = Vector3.new(1, 0.25, 1)
+		part.Color = Color3.fromRGB(221, 45, 45)
+		part.Material = Enum.Material.SmoothPlastic
+		part.TopSurface = Enum.SurfaceType.Studs
+		part.BottomSurface = Enum.SurfaceType.Inlet
+		p = part
+	end
+
+	p.Anchored = true                                                       --          we control transforms manually
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Transparency = 1                                                      --          start hidden
+	p.Name = "Blood"
+
+	return p
+end
+
+local REQUIRED_FIELDS = {                                                  --          minimal schema check so old/bad sharedtables do not break runtime
+	"active","phase","age",
+	"px","py","pz",
+	"vx","vy","vz",
+	"lx","ly","lz",
+	"nx","ny","nz",
+	"ax","ay","az",
+	"avx","avy","avz",
+
+	"support",
+
+	"wall","wallt",
+	"wallx","wally","wallz",
+	"wallnx","wallny","wallnz",
+}
+
+local function isSharedArray(t: any, poolSize: number): boolean             --          validates an indexed array-like structure has at least poolSize entries
+	local tt = typeof(t)
+	if tt ~= "SharedTable" and tt ~= "table" then
+		return false
+	end
+	return t[poolSize] ~= nil
+end
+
+local function stateLooksValid(st: any, poolSize: number): boolean          --          checks pool size + required arrays exist
+	if typeof(st) ~= "SharedTable" and typeof(st) ~= "table" then
+		return false
+	end
+	if type(st.poolSize) ~= "number" or st.poolSize ~= poolSize then
+		return false
+	end
+	for _, k in ipairs(REQUIRED_FIELDS) do
+		if not isSharedArray(st[k], poolSize) then
+			return false
+		end
+	end
+	return true
+end
+
+local function newArray(poolSize: number, initValue: number): any           --          creates a sharedtable array initialized to initValue
+	local t = SharedTable.new()
+	for i = 1, poolSize do
+		t[i] = initValue
+	end
+	return t
+end
+
+local function buildState(poolSize: number): any                            --          builds the complete shared state blob in one place
+	local st = SharedTable.new()
+
+	st.poolSize = poolSize
+
+	st.active = newArray(poolSize, 0)
+	st.phase  = newArray(poolSize, 0)
+	st.age    = newArray(poolSize, 0)
+
+	st.px = newArray(poolSize, 0)
+	st.py = newArray(poolSize, 0)
+	st.pz = newArray(poolSize, 0)
+
+	st.vx = newArray(poolSize, 0)
+	st.vy = newArray(poolSize, 0)
+	st.vz = newArray(poolSize, 0)
+
+	st.lx = newArray(poolSize, 0)
+	st.ly = newArray(poolSize, 0)
+	st.lz = newArray(poolSize, 0)
+
+	st.nx = newArray(poolSize, 0)
+	st.ny = newArray(poolSize, 1)
+	st.nz = newArray(poolSize, 0)
+
+	st.ax = newArray(poolSize, 0)
+	st.ay = newArray(poolSize, 0)
+	st.az = newArray(poolSize, 0)
+
+	st.avx = newArray(poolSize, 0)
+	st.avy = newArray(poolSize, 0)
+	st.avz = newArray(poolSize, 0)
+
+	st.support = newArray(poolSize, 0)
+
+	st.wall   = newArray(poolSize, 0)
+	st.wallt  = newArray(poolSize, 0)
+
+	st.wallx  = newArray(poolSize, 0)
+	st.wally  = newArray(poolSize, 0)
+	st.wallz  = newArray(poolSize, 0)
+
+	st.wallnx = newArray(poolSize, 0)
+	st.wallny = newArray(poolSize, 0)
+	st.wallnz = newArray(poolSize, 0)
+
+	return st
+end
+
+local function getOrCreateState(poolSize: number): any                      --          fetches existing state if valid, otherwise creates fresh and registers it
+	local ok, existing = pcall(function()
+		return SharedTableRegistry:GetSharedTable(STATE_KEY)
+	end)
+
+	if ok and existing and stateLooksValid(existing, poolSize) then
+		return existing
+	end
+
+	local st = buildState(poolSize)
+	SharedTableRegistry:SetSharedTable(STATE_KEY, st)
+	return st
+end
+
+local function computeSurfaceBasis(nx: number, ny: number, nz: number): (Vector3, Vector3) --          builds a stable orthonormal basis from a surface normal
+	local up = Vector3.new(nx, ny, nz)
+	if up.Magnitude < 1e-6 then
+		up = Vector3.new(0, 1, 0)                                            --          fallback if normal is degenerate
+	else
+		up = up.Unit
+	end
+
+	local ref = Vector3.new(0, 1, 0)                                        --          reference axis used to compute right vector
+	local right = up:Cross(ref)
+	if right.Magnitude < 1e-6 then                                          --          handle near-parallel case
+		ref = Vector3.new(1, 0, 0)
+		right = up:Cross(ref)
+	end
+	right = right.Unit
+	return right, up
+end
+
+local function makeSurfaceCFrame(px: number, py: number, pz: number, nx: number, ny: number, nz: number): CFrame --          builds a cframe aligned to surface normal
+	local pos = Vector3.new(px, py, pz)
+	local right, up = computeSurfaceBasis(nx, ny, nz)
+	local back = right:Cross(up)
+	return CFrame.fromMatrix(pos, right, up, back)
+end
+
+local function defaultConfig(): Config                                      --          sensible defaults tuned for performance
+	return {
+		PoolSize = 800,
+		Lifetime = 8,
+
+		SpawnMin = 1,
+		SpawnMax = 3,
+
+		WorkersFolderName = "BloodWorkers",
+		WorkersCloneParent = nil,
+
+		PhysicsHz = 60,
+		HiddenPhysicsHz = 20,
+		RestPhysicsHz = 10,
+		CullHz = 15,
+
+		MaxDrawDistance = 250,
+
+		GravityY = -Workspace.Gravity,
+
+		ArchUpMin = 18,
+		ArchUpMax = 28,
+		ArchOutMin = 6,
+		ArchOutMax = 12,
+
+		AirSpinDamp = 0.55,
+		GroundSpinDamp = 7.5,
+
+		SlideFriction = 3.5,
+		StopSpeed = 0.02,
+
+		SurfaceOffset = 0.02,
+		RaycastUp = 1.5,
+		RaycastDown = 12,
+
+		Template = nil,
+		FolderName = "_ClientBlood",
+
+		-- lowered a bit to reduce raycasts                                --          support checks are frequent, so keep them lean
+		SupportHz = 12,
+		SupportUp = 0.35,
+		SupportDown = 10,
+		SupportEps = 0.12,
+
+		WallPad = 0.20,
+		WallMaxLen = 12.0,
+		WallNormalYMax = 0.80,
+
+		CeilingNormalYMin = 0.35,
+		CeilingBounce = 0.35,
+
+		CollisionRadius = 0.60,
+
+		-- budgets: keep airborne reliable, cap slide checks               --          airborne sweeps prevent tunneling; sliding sweeps are capped hard
+		MaxAirRaycasts = 220,
+		MaxSlideRaycasts = 120,
+	}
+end
+
+function ClientBloodSystem.new(config: Config?): BloodSystem                --          constructs a system instance (does not allocate pool until init)
+	local cfg = defaultConfig()
+	if config then
+		for k, v in pairs(config :: any) do
+			(cfg :: any)[k] = v
+		end
+	end
+
+	local self: BloodSystem = setmetatable({
+		Config = cfg,
+		Initialized = false,
+
+		_state = nil,
+		_parts = {},
+		_visible = {},
+		_activeList = {},
+		_activePos = {},
+		_free = {},
+
+		_folder = nil,
+		_actors = {},
+		_conn = nil,
+
+		_map = nil,
+		_rp = nil,
+		_op = nil,
+	}, ClientBloodSystem)
+
+	return self
+end
+
+function ClientBloodSystem:_cloneWorkers(): { Actor }                       --          clones the actor worker folder into playerscripts (client-side)
+	local workersFolder = ReplicatedStorage:WaitForChild(self.Config.WorkersFolderName) :: Folder
+
+	local player = Players.LocalPlayer
+	local parent = self.Config.WorkersCloneParent
+	if parent == nil then
+		parent = player:WaitForChild("PlayerScripts")
+	end
+
+	local cloned = workersFolder:Clone()
+	cloned.Name = "_BloodWorkers_Cloned"
+	cloned.Parent = parent
+
+	local actors = {}
+	for _, child in ipairs(cloned:GetChildren()) do
+		if child:IsA("Actor") then
+			table.insert(actors, child)
+		end
+	end
+
+	return actors
+end
+
+local function popFree(sys: BloodSystem): number?                            --          pops one free slot index from the free stack
+	local n = #sys._free
+	if n == 0 then
+		return nil
+	end
+	local idx = sys._free[n]
+	sys._free[n] = nil
+	return idx
+end
+
+local function resolveSpawn(sys: BloodSystem, start: Vector3): Vector3       --          tries to avoid spawning inside geometry using cheap overlap checks
+	local op = sys._op
+	if not op then
+		return start
+	end
+
+	local r = math.max(0.15, sys.Config.CollisionRadius * 0.90)              --          slightly smaller than collision radius for tolerance
+
+	local function occupied(p: Vector3): boolean
+		local parts = Workspace:GetPartBoundsInRadius(p, r, op)              --          maxparts=1 => early out as soon as something is found
+		return parts[1] ~= nil
+	end
+
+	if not occupied(start) then                                              --          if clear, return immediately
+		return start
+	end
+
+	-- try step-down + small lateral nudges                                 --          small search that avoids expensive multi-ray solutions
+	local downStep = 0.25
+	local maxDown = 6.0
+	local lateral = 0.35
+
+	local offsets = {
+		Vector3.new(0, 0, 0),
+		Vector3.new(lateral, 0, 0),
+		Vector3.new(-lateral, 0, 0),
+		Vector3.new(0, 0, lateral),
+		Vector3.new(0, 0, -lateral),
+		Vector3.new(lateral, 0, lateral),
+		Vector3.new(-lateral, 0, lateral),
+		Vector3.new(lateral, 0, -lateral),
+		Vector3.new(-lateral, 0, -lateral),
+	}
+
+	local steps = math.floor(maxDown / downStep)
+	for i = 1, steps do
+		local base = start - Vector3.new(0, downStep * i, 0)
+		for j = 1, #offsets do
+			local cand = base + offsets[j]
+			if not occupied(cand) then
+				return cand
+			end
+		end
+	end
+
+	return start - Vector3.new(0, sys.Config.CollisionRadius, 0)              --          last-resort bias downward to reduce “ceiling start” artifacts
+end
+
+function ClientBloodSystem:Init()                                           --          allocates pool, initializes shared state, clones workers, starts render loop
+	if self.Initialized then
+		return
+	end
+	assert(RunService:IsClient(), "ClientBloodSystem must run on the client")
+
+	self._state = getOrCreateState(self.Config.PoolSize)                     --          sharedtable state creation happens once per client
+
+	-- cache map + params                                                   --          avoids per-frame allocations for raycast/overlap params
+	local mapFolder = Workspace:WaitForChild("MAP")
+	self._map = mapFolder
+
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Include
+	rp.FilterDescendantsInstances = { mapFolder }
+	rp.IgnoreWater = true
+	self._rp = rp
+
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Include
+	op.FilterDescendantsInstances = { mapFolder }
+	op.MaxParts = 1                                                         --          early-out
+	op.RespectCanCollide = true
+	self._op = op
+
+	-- pool                                                                 --          allocate parts once, then reuse by toggling transparency + cframe
+	local folder = ensureFolder(self)
+	table.clear(self._parts)
+	table.clear(self._free)
+
+	for i = 1, self.Config.PoolSize do
+		local p = makePartFromTemplate(self)
+		p.Parent = folder
+		p.CFrame = CFrame.new(0, -1e6, 0)                                   --          park far away while hidden
+
+		self._parts[i] = p
+		self._visible[i] = false
+		self._free[i] = i
+
+		self._state.active[i] = 0
+		self._state.phase[i] = 0
+		self._state.age[i] = 0
+		self._state.support[i] = 0
+		self._state.wall[i] = 0
+		self._state.wallt[i] = 0
+	end
+
+	self._actors = self:_cloneWorkers()                                      --          actors run the heavy stepping in parallel
+	self.Initialized = true
+
+	local physAccumVis = 0.0
+	local physStepVis = 1 / math.max(1, self.Config.PhysicsHz)
+
+	local physAccumHid = 0.0
+	local physStepHid = 1 / math.max(1, self.Config.HiddenPhysicsHz)
+
+	local physAccumRest = 0.0
+	local physStepRest = 1 / math.max(1, self.Config.RestPhysicsHz)
+
+	local cullAccum = 0.0
+	local cullStep = 1 / math.max(1, self.Config.CullHz)
+
+	local camDistSq = self.Config.MaxDrawDistance * self.Config.MaxDrawDistance
+
+	local supportAccum = 0.0
+	local supportStep = 1 / math.max(1, self.Config.SupportHz)
+
+	local function updateVisibility()                                        --          updates _visible flags and part transparency based on camera frustum + distance
+		local cam = nowCamera()
+		if not cam then return end
+
+		local vpSize = cam.ViewportSize
+		local cx, cy, cz = cam.CFrame.X, cam.CFrame.Y, cam.CFrame.Z
+
+		for _, idx in ipairs(self._activeList) do
+			local px = self._state.px[idx]
+			local py = self._state.py[idx]
+			local pz = self._state.pz[idx]
+
+			local dx = px - cx
+			local dy = py - cy
+			local dz = pz - cz
+			local d2 = dx*dx + dy*dy + dz*dz
+
+			local vis = false
+			if d2 <= camDistSq then
+				local v, onScreen = cam:WorldToViewportPoint(Vector3.new(px, py, pz))
+				if onScreen and v.Z > 0 then
+					if v.X >= -50 and v.Y >= -50 and v.X <= (vpSize.X + 50) and v.Y <= (vpSize.Y + 50) then
+						vis = true
+					end
+				end
+			end
+
+			if self._visible[idx] ~= vis then
+				self._visible[idx] = vis
+				self._parts[idx].Transparency = vis and 0 or 1               --          only render visible indices (physics can still run at reduced rate)
+			end
+		end
+	end
+
+	local function applyVisuals()                                            --          applies cframe updates and recycles dead slots back into free stack
+		for i = #self._activeList, 1, -1 do
+			local idx = self._activeList[i]
+
+			if self._state.active[idx] == 0 then                             --          slot died => remove from active list with swap-remove
+				local pos = self._activePos[idx]
+				if pos then
+					local lastIdx = self._activeList[#self._activeList]
+					self._activeList[pos] = lastIdx
+					self._activePos[lastIdx] = pos
+					self._activeList[#self._activeList] = nil
+					self._activePos[idx] = nil
+				end
+
+				self._state.wall[idx] = 0
+				self._state.wallt[idx] = 0
+				self._state.support[idx] = 0
+
+				local part = self._parts[idx]
+				part.Transparency = 1
+				part.CFrame = CFrame.new(0, -1e6, 0)
+				self._visible[idx] = false
+
+				self._free[#self._free + 1] = idx                             --          recycle index
+			else
+				if self._visible[idx] then                                   --          only push cframe updates when visible
+					local px = self._state.px[idx]
+					local py = self._state.py[idx]
+					local pz = self._state.pz[idx]
+
+					local ay = self._state.ay[idx]
+					local phase = self._state.phase[idx]
+
+					local cf: CFrame
+					if phase == 1 then                                        --          airborne uses free rotation (ax/ay/az)
+						local ax = self._state.ax[idx]
+						local az = self._state.az[idx]
+						cf = CFrame.new(px, py, pz) * CFrame.Angles(ax, ay, az)
+					else                                                      --          grounded uses surface-aligned basis + yaw
+						local nx = self._state.nx[idx]
+						local ny = self._state.ny[idx]
+						local nz = self._state.nz[idx]
+						cf = makeSurfaceCFrame(px, py, pz, nx, ny, nz) * CFrame.Angles(0, ay, 0)
+					end
+
+					self._parts[idx].CFrame = cf
+				end
+			end
+		end
+	end
+
+	local function dispatchPhysics(dt: number, list: { number })             --          slices indices evenly across actors and sends them a step message
+		local actors = self._actors
+		local n = #actors
+		if n == 0 then return end
+
+		local activeCount = #list
+		if activeCount == 0 then return end
+
+		local per = math.max(1, math.floor((activeCount + n - 1) / n))        --          ceiling division
+
+		for w = 1, n do
+			local a = actors[w]
+			local startPos = (w - 1) * per + 1
+			if startPos > activeCount then break end
+			local endPos = math.min(activeCount, startPos + per - 1)
+
+			local slice = table.create(endPos - startPos + 1)                --          payload slice (small allocation per worker per tick)
+			local s = 1
+			for j = startPos, endPos do
+				slice[s] = list[j]
+				s += 1
+			end
+
+			a:SendMessage("Step", {
+				dt = dt,
+				indices = slice,
+
+				gravityY = self.Config.GravityY,
+				lifetime = self.Config.Lifetime,
+
+				surfaceOffset = self.Config.SurfaceOffset,
+				slideFriction = self.Config.SlideFriction,
+				stopSpeed = self.Config.StopSpeed,
+
+				airSpinDamp = self.Config.AirSpinDamp,
+				groundSpinDamp = self.Config.GroundSpinDamp,
+
+				ceilingNormalYMin = self.Config.CeilingNormalYMin,
+				ceilingBounce = self.Config.CeilingBounce,
+			})
+		end
+	end
+
+	local function updateSupport(list: { number })                           --          refreshes support plane under particles so they can fall off edges
+		local rp = self._rp :: RaycastParams
+		for i = 1, #list do
+			local idx = list[i]
+			local phase = self._state.phase[idx]
+			if phase ~= 0 and phase ~= 3 then                                 --          no need to support-check dead or fully resting
+				local px = self._state.px[idx]
+				local py = self._state.py[idx]
+				local pz = self._state.pz[idx]
+
+				local origin = Vector3.new(px, py, pz) + Vector3.new(0, self.Config.SupportUp, 0)
+				local dir = Vector3.new(0, -(self.Config.SupportUp + self.Config.SupportDown), 0)
+				local hit = Workspace:Raycast(origin, dir, rp)
+
+				if hit then
+					local hx, hy, hz = hit.Position.X, hit.Position.Y, hit.Position.Z
+					local nx, ny, nz = hit.Normal.X, hit.Normal.Y, hit.Normal.Z
+
+					self._state.lx[idx] = hx
+					self._state.ly[idx] = hy
+					self._state.lz[idx] = hz
+					self._state.nx[idx] = nx
+					self._state.ny[idx] = ny
+					self._state.nz[idx] = nz
+
+					local dx = px - hx
+					local dy = py - hy
+					local dz = pz - hz
+					local sep = dx*nx + dy*ny + dz*nz                           --          signed separation from plane
+					self._state.support[idx] = (sep <= (self.Config.SurfaceOffset + self.Config.SupportEps)) and 1 or 0
+				else
+					self._state.support[idx] = 0
+				end
+			end
+		end
+	end
+
+	local function updateWallsBudgeted(list: { number }, dt: number)         --          continuous sweep (toi) with strict raycast budgets to avoid spikes
+		local rp = self._rp :: RaycastParams
+
+		local radius = self.Config.CollisionRadius
+		local pad = self.Config.WallPad
+		local maxLen = self.Config.WallMaxLen
+		local nyMax = self.Config.WallNormalYMax
+		local ceilMin = self.Config.CeilingNormalYMin
+
+		local function tryOne(idx: number, phase: number): boolean           --          tries to set wall/wallt + wall normal for one index
+			if self._state.wall[idx] ~= 0 then
+				return false
+			end
+
+			local vx = self._state.vx[idx]
+			local vy = self._state.vy[idx]
+			local vz = self._state.vz[idx]
+
+			local sp2 = vx*vx + vy*vy + vz*vz
+			if sp2 <= 0.0025 then                                            --          too slow => not worth sweeping
+				return false
+			end
+
+			local sp = math.sqrt(sp2)
+			local ux = vx / sp
+			local uy = vy / sp
+			local uz = vz / sp
+
+			local len = sp * dt + radius + pad                               --          sweep length = travel + radius + pad
+			if len > maxLen then
+				len = maxLen
+			end
+
+			local px = self._state.px[idx]
+			local py = self._state.py[idx]
+			local pz = self._state.pz[idx]
+
+			local origin = Vector3.new(px, py, pz)
+			local dir = Vector3.new(ux * len, uy * len, uz * len)
+
+			local hit = Workspace:Raycast(origin, dir, rp)
+			if not hit then
+				return false
+			end
+
+			local nY = hit.Normal.Y
+			local isSide = math.abs(nY) < nyMax                               --          side wall classification
+			local isCeil = (phase == 1) and (nY <= -ceilMin)                  --          ceiling classification (air only)
+
+			if not (isSide or isCeil) then
+				return false
+			end
+
+			local d = hit.Distance
+			local stopDist = d - radius                                       --          stop at contact point minus radius so the center does not penetrate
+			if stopDist < 0 then stopDist = 0 end
+
+			local t = stopDist / len                                          --          time fraction to contact
+			if t < 0 then t = 0 end
+			if t > 1 then t = 1 end
+
+			self._state.wall[idx] = 1
+			self._state.wallt[idx] = t
+
+			self._state.wallx[idx] = px + ux * stopDist
+			self._state.wally[idx] = py + uy * stopDist
+			self._state.wallz[idx] = pz + uz * stopDist
+
+			self._state.wallnx[idx] = hit.Normal.X
+			self._state.wallny[idx] = hit.Normal.Y
+			self._state.wallnz[idx] = hit.Normal.Z
+
+			return true
+		end
+
+		local airBudget = self.Config.MaxAirRaycasts                           --          airborne sweeps first (highest value)
+		for i = 1, #list do
+			if airBudget <= 0 then break end
+			local idx = list[i]
+			local phase = self._state.phase[idx]
+			if phase == 1 then
+				if tryOne(idx, 1) then
+					airBudget -= 1
+				end
+			end
+		end
+
+		local slideBudget = self.Config.MaxSlideRaycasts                        --          sliding sweeps second (hard-capped)
+		for i = 1, #list do
+			if slideBudget <= 0 then break end
+			local idx = list[i]
+			local phase = self._state.phase[idx]
+			if phase == 2 then
+				if tryOne(idx, 2) then
+					slideBudget -= 1
+				end
+			end
+		end
+	end
+
+	self._conn = RunService.RenderStepped:Connect(function(dt)               --          main loop: cull -> visuals -> physics dispatch
+		local cam = nowCamera()
+		if cam and self._folder and self._folder.Parent ~= cam then
+			self._folder.Parent = cam                                        --          keep folder under current camera
+		end
+
+		cullAccum += dt
+		if cullAccum >= cullStep then
+			cullAccum = 0
+			updateVisibility()
+		end
+
+		applyVisuals()
+
+		physAccumVis += dt
+		physAccumHid += dt
+		physAccumRest += dt
+
+		local doVis = physAccumVis >= physStepVis
+		local doHid = physAccumHid >= physStepHid
+		local doRest = physAccumRest >= physStepRest
+
+		if doVis or doHid or doRest then
+			local visList = table.create(64)                                 --          indices visible this frame
+			local hidList = table.create(64)                                 --          indices hidden (offscreen or far)
+			local restList = table.create(64)                                --          indices resting
+
+			local vN, hN, rN = 0, 0, 0
+
+			for _, idx in ipairs(self._activeList) do
+				local phase = self._state.phase[idx]
+				if phase == 3 then
+					rN += 1
+					restList[rN] = idx
+				elseif self._visible[idx] then
+					vN += 1
+					visList[vN] = idx
+				else
+					hN += 1
+					hidList[hN] = idx
+				end
+			end
+
+			if doVis then                                                    --          visible tick does support + sweeps + step
+				local stepDt = math.min(physAccumVis, 0.1)
+				physAccumVis = 0
+
+				supportAccum += stepDt
+				if supportAccum >= supportStep then
+					supportAccum = 0
+					updateSupport(visList)
+				end
+
+				updateWallsBudgeted(visList, stepDt)
+				dispatchPhysics(stepDt, visList)
+			end
+
+			if doHid then                                                    --          hidden tick only steps (no extra ray work)
+				local stepDt = math.min(physAccumHid, 0.1)
+				physAccumHid = 0
+				dispatchPhysics(stepDt, hidList)
+			end
+
+			if doRest then                                                   --          resting tick steps at low rate (mostly spin settle)
+				local stepDt = math.min(physAccumRest, 0.1)
+				physAccumRest = 0
+				dispatchPhysics(stepDt, restList)
+			end
+		end
+	end)
+end
+
+function ClientBloodSystem:Splash(at: Vector3 | BasePart)                   --          spawns a small burst of blood particles at a position or part
+	if not self.Initialized then
+		self:Init()
+	end
+
+	local pos: Vector3
+	if typeof(at) == "Instance" then
+		pos = (at :: BasePart).Position
+	else
+		pos = at :: Vector3
+	end
+
+	local spawnCount = math.random(self.Config.SpawnMin, self.Config.SpawnMax)
+	local folder = ensureFolder(self)
+
+	local rp = self._rp :: RaycastParams
+
+	for _ = 1, spawnCount do
+		local idx = popFree(self)                                            --          acquire a slot
+		if not idx then
+			break
+		end
+
+		local jitter = Vector3.new(
+			(math.random() - 0.5) * 0.25,
+			(math.random() - 0.5) * 0.10,
+			(math.random() - 0.5) * 0.25
+		)
+
+		local start = resolveSpawn(self, pos + jitter)                        --          prevent starting inside geometry
+
+		local upClamp = math.min(self.Config.RaycastUp, math.max(0.25, self.Config.CollisionRadius * 0.55)) --          keep origin from going above low ceilings
+		local origin = start + Vector3.new(0, upClamp, 0)
+		local dir = Vector3.new(0, -(upClamp + self.Config.RaycastDown), 0)
+
+		local hit = Workspace:Raycast(origin, dir, rp)
+
+		local lx, ly, lz = start.X, start.Y, start.Z                         --          initial support point (fallback to start)
+		local nx, ny, nz = 0, 1, 0                                           --          initial support normal
+		if hit then
+			lx, ly, lz = hit.Position.X, hit.Position.Y, hit.Position.Z
+			nx, ny, nz = hit.Normal.X, hit.Normal.Y, hit.Normal.Z
+		end
+
+		local theta = math.random() * math.pi * 2                             --          random direction for outward velocity
+		local out = self.Config.ArchOutMin + (self.Config.ArchOutMax - self.Config.ArchOutMin) * math.random()
+		local up = self.Config.ArchUpMin + (self.Config.ArchUpMax - self.Config.ArchUpMin) * math.random()
+
+		local vx = math.cos(theta) * out
+		local vz = math.sin(theta) * out
+		local vy = up
+
+		do                                                                    --          safety: if still overlapping after resolve, bias velocity downward
+			local op = self._op
+			if op then
+				local parts = Workspace:GetPartBoundsInRadius(start, math.max(0.15, self.Config.CollisionRadius * 0.90), op)
+				if parts[1] ~= nil then
+					vy = -math.abs(vy) * 0.25
+					vx *= 0.5
+					vz *= 0.5
+				end
+			end
+		end
+
+		local avx = (math.random() - 0.5) * 30                                --          random spin so airborne splats look lively
+		local avy = (math.random() - 0.5) * 44
+		local avz = (math.random() - 0.5) * 30
+
+		self._state.active[idx] = 1                                          --          activate slot
+		self._state.phase[idx] = 1                                           --          start airborne
+		self._state.age[idx] = 0
+
+		self._state.px[idx] = start.X
+		self._state.py[idx] = start.Y
+		self._state.pz[idx] = start.Z
+
+		self._state.vx[idx] = vx
+		self._state.vy[idx] = vy
+		self._state.vz[idx] = vz
+
+		self._state.lx[idx] = lx
+		self._state.ly[idx] = ly
+		self._state.lz[idx] = lz
+
+		self._state.nx[idx] = nx
+		self._state.ny[idx] = ny
+		self._state.nz[idx] = nz
+
+		self._state.ax[idx] = math.random() * math.pi * 2                    --          random starting orientation
+		self._state.ay[idx] = math.random() * math.pi * 2
+		self._state.az[idx] = math.random() * math.pi * 2
+
+		self._state.avx[idx] = avx
+		self._state.avy[idx] = avy
+		self._state.avz[idx] = avz
+
+		self._state.support[idx] = 0
+		self._state.wall[idx] = 0
+		self._state.wallt[idx] = 0
+
+		self._activeList[#self._activeList + 1] = idx                         --          track as active for iteration
+		self._activePos[idx] = #self._activeList
+
+		self._parts[idx].Parent = folder
+		self._parts[idx].Transparency = 1                                     --          will be toggled visible by culling logic
+		self._visible[idx] = false
+	end
+end
+
+function ClientBloodSystem:Destroy()                                       --          disconnects loop and destroys pooled instances
+	if self._conn then
+		self._conn:Disconnect()
+		self._conn = nil
+	end
+	for _, p in ipairs(self._parts) do
+		if p then
+			p:Destroy()
+		end
+	end
+	self._parts = {}
+	self._activeList = {}
+	self._activePos = {}
+	self._free = {}
+	self._actors = {}
+	if self._folder then
+		self._folder:Destroy()
+		self._folder = nil
+	end
+	self.Initialized = false
+end
+
+return ClientBloodSystem
