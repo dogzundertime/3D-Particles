@@ -2,25 +2,37 @@
 --!strict
 
 --[[
-	- \\ this file is the client side owner of the blood pool and visuals
-	- \\ why: instances are expensive + not thread safe, so we keep all part creation, parenting, and cframe writes on the main client thread
-	- \\ why: the worker threads should only touch raw numbers (sharedtable), otherwise you risk racey instance access + hidden engine sync costs
+	- \\ this code owns the client-side blood pool and visuals
+	- \\ instances are expensive and not thread safe, so all part creation, parenting, and cframe writes stay on the main client thread
+	- \\ worker threads only touch raw numbers (sharedtable), so we avoid racey instance access and hidden engine sync costs
 
 	- \\ actors do the stepping work so the main thread mostly just culls and writes cframes
-	- \\ why: the expensive part is the per-particle physics-ish integration and collision decisions; actors let that run in parallel luau contexts
-	- \\ why: renderstepped should be kept lean so camera + ui + input never hitch, even if you spam splashes
+	- \\ the expensive part is per-particle integration + collision decisions; actors let that run in parallel luau contexts
+	- \\ renderstepped stays lean so camera, ui, and input don’t hitch even if splashes get spammed
 
-	- \\ sharedtable is the handoff contract so this script builds the schema and defends it from stale versions
-	- \\ why: hot reloads / place version drift can leave old sharedtables alive; if we assume fields exist, one missing array can crash the render loop
-	- \\ why: schema lives here so workers can be dumb-fast (no branching for nil / no per-step validation)
+	- \\ sharedtable is the handoff contract, so this script defines the schema and defends it from stale versions
+	- \\ hot reloads / version drift can leave old sharedtables alive; one missing array can crash the render loop
+	- \\ keeping schema here means workers can stay branch-free (no nil checks, no per-step validation)
 
-	- \\ the main goal is predictable frametime even if splash gets spammed
-	- \\ why: effects are "nice to have"; if the effect can tank fps then it becomes a gameplay bug
-	- \\ why: the design uses hard budgets (pool size, raycast caps, tick rates) so worst-case cost is bounded
+	- \\ the goal is predictable frametime under worst case spam
+	- \\ effects are “nice to have”; if the effect can tank fps it becomes a gameplay bug
+	- \\ hard budgets (pool size, raycast caps, tick rates) keep worst-case cost bounded
 
-	- \\ we would rather drop particles than hitch the client
-	- \\ why: saturation behavior should fail "quietly" (fewer splats) instead of failing "loudly" (frame spikes, input lag)
-	- \\ why: a stable 60/120 fps with fewer particles looks better than 5 fps with perfect particles
+	- \\ we intentionally drop particles instead of hitching the client
+	- \\ saturation should fail quietly (fewer splats) instead of loudly (frame spikes, input lag)
+
+	- \\ dataflow (how the pieces connect)
+	- \\   1) Splash() reserves a free slot, writes all state arrays for that slot, then publishes it as active
+	- \\   2) RenderStepped:
+	- \\        - updateVisibility() runs at low hz and fills _visible so we can skip expensive work later
+	- \\        - applyVisuals() runs every frame to reclaim dead slots and write cframes for visible ones
+	- \\        - active slots are partitioned into visible / hidden / resting lists (cost follows usefulness)
+	- \\   3) client collision helpers (single source of raycasts):
+	- \\        - updateSupport() refreshes “floor support” so splats can lose support and fall off edges
+	- \\        - updateWallsBudgeted() does budgeted sweeps and stores time-of-impact + normal for workers
+	- \\   4) dispatchPhysics() sends dt + indices + small config to actor workers
+	- \\   5) workers integrate and flip active=0 when lifetime ends
+	- \\   6) applyVisuals() sees that flip and returns the slot to _free for constant-time reuse
 ]]
 
 local Players = game:GetService("Players")
@@ -39,30 +51,23 @@ export type Config = {
 	WorkersFolderName: string,
 
 	-- - \\ if nil we clone workers into the local playerscripts so it works in most setups
-	-- - \\ why: actors must exist on the local client to receive sendmessage; cloning avoids needing manual place wiring
-	-- - \\ why: playerscripts survives respawns and is a safe client-only container
+	-- - \\ actors must exist on this client to receive sendmessage, and cloning avoids manual place wiring
 	WorkersCloneParent: Instance?,
 
-	-- - \\ these rates let us spend the most time on what the player can actually see
-	-- - \\ why: visible particles get higher stepping rate to look smooth; hidden/resting get cheaper rates to avoid wasted work
-	-- - \\ why: variable rate is the easiest multiplier on performance without changing visual density
+	-- - \\ spend time where it actually shows
+	-- - \\ visible particles get a higher stepping rate; hidden/resting get cheaper rates so we don’t waste work
 	PhysicsHz: number,
 	HiddenPhysicsHz: number,
 	RestPhysicsHz: number,
 
-	-- - \\ culling is separated so we do not pay camera math every frame unless we choose to
-	-- - \\ why: camera projection tests are non-trivial; decoupling lets you tune "popping" vs cost
-	-- - \\ why: visibility changes slower than render frames, so sampling visibility at 10-20hz is usually enough
+	-- - \\ culling is separated so we don’t pay camera math every single frame
+	-- - \\ visibility doesn’t change as fast as render frames, so sampling at ~10-20hz is usually enough
 	CullHz: number,
 
 	-- - \\ distance cap is a simple safety valve for giant maps
-	-- - \\ why: world to viewport checks + cframe writes scale with active count; a hard radius guarantees an upper bound
-	-- - \\ why: far-away particles provide almost no value, so they are the first to cheap-out
 	MaxDrawDistance: number,
 
-	-- - \\ stored here so workers do not need to call workspace gravity
-	-- - \\ why: keeping config in the message avoids workers reaching into services (less overhead, fewer cross-context calls)
-	-- - \\ why: if gravity changes per-map, the client can push the new value without patching workers
+	-- - \\ stored here so workers don’t need to touch services
 	GravityY: number,
 
 	ArchUpMin: number,
@@ -84,43 +89,28 @@ export type Config = {
 	FolderName: string,
 
 	-- - \\ support refresh lets splats fall when their ledge support disappears
-	-- - \\ why: initial landing plane can become invalid when geometry changes (destructible, moving parts, streamed chunks)
-	-- - \\ why: refreshing support prevents "hovering decals" and lets gravity re-take control naturally
 	SupportHz: number,
 	SupportUp: number,
 	SupportDown: number,
 	SupportEps: number,
 
-	-- - \\ sweeps are budgeted so fast particles do not tunnel but we also do not spike the frame
-	-- - \\ why: continuous collision detection (sweeps) is the correct fix for tunneling, but it is also the most expensive
-	-- - \\ why: budget caps prevent worst-case "spray into wall" from doing thousands of raycasts in a single tick
+	-- - \\ sweeps prevent tunneling but are expensive, so they’re budgeted
 	WallPad: number,
 	WallMaxLen: number,
 
-	-- - \\ abs of ny below this means we treat the surface as a side wall
-	-- - \\ why: floors/ground are handled by support logic; walls need different response (slide / stop / bounce)
-	-- - \\ why: using ny is a cheap classifier instead of material tags or complicated normals logic
+	-- - \\ abs of ny below this means “treat it like a side wall”
 	WallNormalYMax: number,
 
-	-- - \\ ny at or below negative this means we treat it as a ceiling while airborne
-	-- - \\ why: ceilings are special because you can stick under them visually if you only do floor support checks
-	-- - \\ why: only apply when airborne because grounded particles should already be stable and not bouncing
+	-- - \\ ny at or below negative this means “treat it like a ceiling” while airborne
 	CeilingNormalYMin: number,
 
-	-- - \\ bounce is a simple visual cue and also stops particles from sticking under ceilings
-	-- - \\ value is meant to be between zero and one
-	-- - \\ why: a tiny bounce reads like splash energy and prevents the "glued to ceiling" artifact
-	-- - \\ why: keeping it [0..1] makes tuning predictable (0 = dead stop, 1 = full reflect-ish)
+	-- - \\ small bounce keeps droplets from looking glued under ceilings and reads like splash energy
 	CeilingBounce: number,
 
-	-- - \\ used for spawn occupancy checks and sweep stop distance so we do not clip through thin stuff
-	-- - \\ why: we treat particles like spheres for cheap collision; radius is the one parameter that keeps it consistent
-	-- - \\ why: both overlap tests and sweep stop distance depend on the same notion of "how big is a splat blob"
+	-- - \\ particles are treated like spheres for cheap collision
 	CollisionRadius: number,
 
 	-- - \\ hard caps for raycasts per tick so worst case stays predictable
-	-- - \\ why: you cannot allow unbounded raycasts on client; it will eventually hitch on some machine or some map
-	-- - \\ why: separate caps because airborne moves fastest (needs more ccd), sliding is slower (can be cheaper)
 	MaxAirRaycasts: number,
 	MaxSlideRaycasts: number,
 }
@@ -129,48 +119,30 @@ type BloodSystem = {
 	Config: Config,
 	Initialized: boolean,
 
-	-- - \\ sharedtable is the worker contract so it stays flat and array based
-	-- - \\ why: struct-of-arrays is cache friendly + avoids allocating per-particle tables every splash
-	-- - \\ why: workers can do tight numeric loops without table churn or metamethod surprises
+	-- - \\ sharedtable is the worker contract, kept flat and array-based
+	-- - \\ struct-of-arrays avoids per-particle tables and keeps per-step loops tight and predictable
 	_state: any,
 
-	-- - \\ parts are owned only by the client thread so workers never touch instances
-	-- - \\ why: instances are not safe across parallel contexts and can force engine synchronization
-	-- - \\ why: keeping instance ownership here avoids unpredictable costs and thread violations
+	-- - \\ parts are owned only by the client thread; workers never touch instances
 	_parts: { BasePart },
 
 	-- - \\ cached visibility so we avoid writing cframes for offscreen items
-	-- - \\ why: cframe assignment is one of the most expensive per-item operations on the client
-	-- - \\ why: if it's not on screen, moving it buys you nothing but cost
 	_visible: { [number]: boolean },
 
-	-- - \\ dense active list keeps work proportional to what is alive not pool size
-	-- - \\ why: pool size is a capacity; active count is the true workload
-	-- - \\ why: iterating 800 every tick is wasteful if only 40 are alive
+	-- - \\ dense active list keeps work proportional to what’s alive, not to pool size
 	_activeList: { number },
 
-	-- - \\ position map enables fast swap remove without searching
-	-- - \\ why: removing from the middle of an array is expensive unless you swap-remove
-	-- - \\ why: map gives O(1) "where is idx in activeList" so reclamation stays cheap under mass death
+	-- - \\ position map enables O(1) swap-remove during reclamation
 	_activePos: { [number]: number },
 
-	-- - \\ free stack gives constant time allocation under spam
-	-- - \\ why: this is the "drop particles instead of hitch" mechanism; allocation never searches for holes
-	-- - \\ why: stack pop is stable and fast compared to scanning for inactive indices
+	-- - \\ free stack gives constant-time allocation under spam
 	_free: { number },
 
 	_folder: Folder?,
-
-	-- - \\ cloned actors let us spread stepping across parallel contexts
-	-- - \\ why: one actor is still one lua context; multiple actors gives parallel throughput
-	-- - \\ why: we choose to parallelize the numeric integration instead of the rendering
 	_actors: { Actor },
-
 	_conn: RBXScriptConnection?,
 
-	-- - \\ cached ray params so we do not allocate or rebuild filters every tick
-	-- - \\ why: creating params / rebuilding filters causes allocations and can trigger gc
-	-- - \\ why: raycasts are frequent, so we prebuild the params and reuse
+	-- - \\ cached ray/overlap params so we don’t allocate every tick
 	_map: Instance?,
 	_rp: RaycastParams?,
 	_op: OverlapParams?,
@@ -180,83 +152,11 @@ local ClientBloodSystem = {}
 ClientBloodSystem.__index = ClientBloodSystem
 
 -- - \\ key must match the worker key or the client and worker will talk past each other
--- - \\ why: sharedtable registry is basically a global dictionary; mismatch means worker reads a different table and nothing updates
--- - \\ why: versioning in the key is a cheap guard so old workers don't accidentally interpret new schema
+-- - \\ versioning in the key is a cheap guard so old workers don’t interpret new schema
 local STATE_KEY = "_BLOOD_STATE_V1"
 
-local function nowCamera(): Camera?
-	-- - \\ camera can be replaced by respawn or camera scripts so we always fetch current
-	-- - \\ why: storing camera once can go stale and cause nil access or parenting into the wrong object
-	-- - \\ why: using currentcamera each time is cheap compared to debugging broken camera swaps
-	return Workspace.CurrentCamera
-end
-
-local function ensureFolder(sys: BloodSystem): Folder
-	-- - \\ keep all instances under one folder so cleanup is easy and the tree stays tidy
-	-- - \\ why: pooling means lots of parts exist for the entire session; grouping prevents workspace clutter
-	-- - \\ parenting under camera makes it obvious this is client only and avoids cluttering workspace
-	-- - \\ why: camera is a natural "client visual container"; it won't replicate and signals ownership clearly
-	if sys._folder and sys._folder.Parent ~= nil then
-		return sys._folder
-	end
-
-	local f = Instance.new("Folder")
-	f.Name = sys.Config.FolderName
-
-	local cam = nowCamera()
-	if cam then
-		f.Parent = cam
-	else
-		-- - \\ camera can be nil briefly during load so we still allow init to complete
-		-- - \\ why: blocking init on camera availability can deadlock effects during early load / respawn windows
-		-- - \\ why: we prefer a safe fallback parent and later reparent when the camera exists
-		f.Parent = Workspace
-	end
-
-	sys._folder = f
-	return f
-end
-
-local function makePartFromTemplate(sys: BloodSystem): BasePart
-	-- - \\ pooling is the main lever for smoothness since clone destroy churn causes gc hitches
-	-- - \\ why: the expensive part is not just clone; it's also property replication inside engine + eventual gc pressure
-	-- - \\ why: by creating once and reusing, we pay cost upfront and keep runtime stable
-	local template = sys.Config.Template
-	local p: BasePart
-
-	if template then
-		p = template:Clone()
-	else
-		local part = Instance.new("Part")
-		part.Size = Vector3.new(1, 0.25, 1)
-		part.Color = Color3.fromRGB(221, 45, 45)
-		part.Material = Enum.Material.SmoothPlastic
-		part.TopSurface = Enum.SurfaceType.Studs
-		part.BottomSurface = Enum.SurfaceType.Inlet
-		p = part
-	end
-
-	-- - \\ visuals only so we shut off physics and queries to avoid extra cost and weird interactions
-	-- - \\ why: physics solver work (contacts, broadphase) is wasted if we are manually simming + anchoring
-	-- - \\ why: queries/touch events can create hidden overhead and unexpected gameplay triggers
-	p.Anchored = true
-	p.CanCollide = false
-	p.CanQuery = false
-	p.CanTouch = false
-	p.CastShadow = false
-
-	-- - \\ start hidden so there is never a flash on creation or reuse
-	-- - \\ why: when parts are created/reparented, you can get a single-frame visibility glitch if transparency isn't set first
-	-- - \\ why: on reuse, you don't want the old cframe to flash before you place it
-	p.Transparency = 1
-	p.Name = "Blood"
-
-	return p
-end
-
--- - \\ minimal schema guard so stale sharedtables do not crash the render loop
--- - \\ why: sharedtable registry can hold an older schema after hot reload; accessing missing arrays would hard error
--- - \\ why: we do the validation once at init instead of paying checks inside every tight loop
+-- - \\ minimal schema guard so stale sharedtables don’t crash the render loop after hot reload
+-- - \\ we validate once at init so the hot loops can stay branch-free
 local REQUIRED_FIELDS = {
 	"active",
 	"phase",
@@ -290,24 +190,83 @@ local REQUIRED_FIELDS = {
 	"wallnz",
 }
 
+local function nowCamera(): Camera?
+	-- - \\ camera can be replaced by respawn or camera scripts, so always fetch current
+	-- - \\ caching it once can go stale and lead to nil access or parenting into the wrong object
+	return Workspace.CurrentCamera
+end
+
+local function ensureFolder(sys: BloodSystem): Folder
+	-- - \\ keep all instances under one folder for easy cleanup and a tidy instance tree
+	-- - \\ parenting under camera makes ownership obvious (client-only) and avoids cluttering workspace
+	if sys._folder and sys._folder.Parent ~= nil then
+		return sys._folder
+	end
+
+	local f = Instance.new("Folder")
+	f.Name = sys.Config.FolderName
+
+	local cam = nowCamera()
+	if cam then
+		f.Parent = cam
+	else
+		-- - \\ camera can be nil briefly during load, so don’t block init on it
+		-- - \\ we’ll reparent later when the camera exists
+		f.Parent = Workspace
+	end
+
+	sys._folder = f
+	return f
+end
+
+local function makePartFromTemplate(sys: BloodSystem): BasePart
+	-- - \\ pooling is the main lever for smoothness; clone/destroy churn causes gc hitches
+	-- - \\ creating once and reusing means the “spam case” stays stable instead of spiking randomly
+	local template = sys.Config.Template
+	local p: BasePart
+
+	if template then
+		p = template:Clone()
+	else
+		local part = Instance.new("Part")
+		part.Size = Vector3.new(1, 0.25, 1)
+		part.Color = Color3.fromRGB(221, 45, 45)
+		part.Material = Enum.Material.SmoothPlastic
+		part.TopSurface = Enum.SurfaceType.Studs
+		part.BottomSurface = Enum.SurfaceType.Inlet
+		p = part
+	end
+
+	-- - \\ visuals only: shut off physics and queries to avoid hidden overhead and weird interactions
+	-- - \\ this system “simulates” with numbers already, so letting physics/touch/query run would be double work
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+
+	-- - \\ start hidden to avoid one-frame flashes on creation/reuse
+	-- - \\ when parts get parented or reused, a single bad frame is enough to look like a pop
+	p.Transparency = 1
+	p.Name = "Blood"
+
+	return p
+end
+
 local function isSharedArray(t: any, poolSize: number): boolean
-	-- - \\ accept plain tables for quick tests but sharedtable is what workers are tuned for
-	-- - \\ why: this makes the module easier to unit test without actors / sharedtable registry
-	-- - \\ why: production path is sharedtable because it has better cross-context semantics and performance expectations
+	-- - \\ accept plain tables for quick tests, but sharedtable is the real production path
 	local tt = typeof(t)
 	if tt ~= "SharedTable" and tt ~= "table" then
 		return false
 	end
 
-	-- - \\ cheap check that the array is indexable up to the pool size without scanning it
-	-- - \\ why: scanning every element is O(n) and can cost during init; we only need to know "does it look sized"
-	-- - \\ why: checking last index catches common mismatch cases without doing work proportional to pool size
+	-- - \\ cheap “looks sized” check without scanning the whole array
+	-- - \\ we only need a quick sanity check that indexing won’t explode later
 	return t[poolSize] ~= nil
 end
 
 local function stateLooksValid(st: any, poolSize: number): boolean
-	-- - \\ if pool sizes mismatch then part index mapping breaks immediately
-	-- - \\ why: part i is assumed to correspond to state arrays at i; mismatched size would index nil or wrong particle
+	-- - \\ pool size mismatch breaks the index mapping immediately (part i <-> state arrays i)
 	if typeof(st) ~= "SharedTable" and typeof(st) ~= "table" then
 		return false
 	end
@@ -326,9 +285,8 @@ local function stateLooksValid(st: any, poolSize: number): boolean
 end
 
 local function newArray(poolSize: number, initValue: number): any
-	-- - \\ struct of arrays avoids per particle tables and keeps mutation cheap for workers
-	-- - \\ why: per-particle tables cause allocator churn and poor cache locality
-	-- - \\ why: arrays let workers do contiguous numeric access patterns (fewer hash lookups)
+	-- - \\ arrays keep per-particle state cheap and predictable for workers
+	-- - \\ workers do tight numeric loops; tables-of-tables would add allocator churn and hash overhead
 	local t = SharedTable.new()
 	for i = 1, poolSize do
 		t[i] = initValue
@@ -337,13 +295,13 @@ local function newArray(poolSize: number, initValue: number): any
 end
 
 local function buildState(poolSize: number): any
-	-- - \\ one place to define the schema so it does not drift between client and worker
-	-- - \\ why: schema drift is the #1 cause of "nothing moves" bugs in shared memory setups
-	-- - \\ why: keeping it centralized ensures adding a field is a single edit, not a multi-file hunt
+	-- - \\ single source of truth for the schema so client/worker don’t drift
+	-- - \\ if schema drifts, you get “nothing moves” or “random nil” bugs that are painful to diagnose
 	local st = SharedTable.new()
 
 	st.poolSize = poolSize
 
+	-- - \\ intentionally numbers only: no instances, no nested tables, no userdata
 	st.active = newArray(poolSize, 0)
 	st.phase = newArray(poolSize, 0)
 	st.age = newArray(poolSize, 0)
@@ -389,9 +347,8 @@ local function buildState(poolSize: number): any
 end
 
 local function getOrCreateState(poolSize: number): any
-	-- - \\ reusing a valid existing state makes hot reload less jarring and avoids instant resets
-	-- - \\ why: during live edit, resetting the pool can cause visual popping + broken indices mid-frame
-	-- - \\ why: if schema matches, reuse is strictly cheaper and more stable
+	-- - \\ reuse a valid existing state so hot reloads don’t cause a hard visual reset mid-session
+	-- - \\ this keeps “live edit” less jarring and avoids wasting time rebuilding if the schema matches
 	local ok, existing = pcall(function()
 		return SharedTableRegistry:GetSharedTable(STATE_KEY)
 	end)
@@ -401,17 +358,16 @@ local function getOrCreateState(poolSize: number): any
 	end
 
 	local st = buildState(poolSize)
-	-- - \\ we set it only when we know it matches our schema
-	-- - \\ why: registry is shared; if you set partial/invalid state, all workers will read garbage
+
+	-- - \\ only publish when the schema is complete and consistent
+	-- - \\ registry is shared; publishing partial/invalid state means every worker reads garbage immediately
 	SharedTableRegistry:SetSharedTable(STATE_KEY, st)
 	return st
 end
 
 local function computeSurfaceBasis(nx: number, ny: number, nz: number): (Vector3, Vector3)
-	-- - \\ grounded particles need a stable basis or they can jitter when normals are borderline
-	-- - \\ why: if you build orientation from an unstable cross product, tiny normal noise causes large yaw flips
-	-- - \\ handle degenerate normals and near parallel cases so we never end up with zero vectors
-	-- - \\ why: a near-zero vector normalized becomes nan/inf which will explode cframes and poison the render path
+	-- - \\ grounded particles need a stable basis so they don’t yaw-flip on tiny normal noise
+	-- - \\ degenerate normals can produce nan/inf if you normalize a near-zero vector
 	local up = Vector3.new(nx, ny, nz)
 	if up.Magnitude < 1e-6 then
 		up = Vector3.new(0, 1, 0)
@@ -422,8 +378,7 @@ local function computeSurfaceBasis(nx: number, ny: number, nz: number): (Vector3
 	local ref = Vector3.new(0, 1, 0)
 	local right = up:Cross(ref)
 	if right.Magnitude < 1e-6 then
-		-- - \\ if up is basically parallel to world up, we pick a different reference axis
-		-- - \\ why: cross of parallel vectors is ~0, so we need a fallback axis to build a valid basis
+		-- - \\ if up is basically parallel to world up, pick another axis so the cross product isn’t ~0
 		ref = Vector3.new(1, 0, 0)
 		right = up:Cross(ref)
 	end
@@ -433,9 +388,8 @@ local function computeSurfaceBasis(nx: number, ny: number, nz: number): (Vector3
 end
 
 local function makeSurfaceCFrame(px: number, py: number, pz: number, nx: number, ny: number, nz: number): CFrame
-	-- - \\ frommatrix is consistent and avoids lookat ambiguity on shallow slopes
-	-- - \\ why: lookat can twist unpredictably because "forward" is underconstrained when you only know an up normal
-	-- - \\ why: frommatrix lets us explicitly define right/up/back for deterministic orientation
+	-- - \\ frommatrix is deterministic when you mostly know “up”
+	-- - \\ lookat can twist unpredictably because forward is underconstrained
 	local pos = Vector3.new(px, py, pz)
 	local right, up = computeSurfaceBasis(nx, ny, nz)
 	local back = right:Cross(up)
@@ -443,9 +397,8 @@ local function makeSurfaceCFrame(px: number, py: number, pz: number, nx: number,
 end
 
 local function defaultConfig(): Config
-	-- - \\ defaults aim for nice visuals while keeping worst case work bounded
-	-- - \\ why: defaults should be "safe" on mid-tier hardware and big maps; people can scale up later
-	-- - \\ why: the limiting factors here are raycasts and cframe writes, so budgets are set accordingly
+	-- - \\ safe defaults: decent visuals, but bounded worst-case work
+	-- - \\ the expensive bits are raycasts and cframe writes, so budgets are set around those
 	return {
 		PoolSize = 800,
 		Lifetime = 8,
@@ -483,8 +436,7 @@ local function defaultConfig(): Config
 		Template = nil,
 		FolderName = "_ClientBlood",
 
-		-- - \\ support checks happen often so we keep them lean
-		-- - \\ why: support checks are frequent and can dominate raycast count; low-cost math + single ray is the sweet spot
+		-- - \\ support checks are frequent, so keep them lean
 		SupportHz = 12,
 		SupportUp = 0.35,
 		SupportDown = 10,
@@ -499,17 +451,14 @@ local function defaultConfig(): Config
 
 		CollisionRadius = 0.60,
 
-		-- - \\ budgets keep airborne reliable and cap slide sweeps hard
-		-- - \\ why: airborne has highest speed so it gets more ccd budget; sliding gets less because it should be slower and mostly constrained
 		MaxAirRaycasts = 220,
 		MaxSlideRaycasts = 120,
 	}
 end
 
 function ClientBloodSystem.new(config: Config?): BloodSystem
-	-- - \\ copy config once so callers cannot mutate tuning mid sim and cause hard to debug behavior
-	-- - \\ why: shared config mutation mid-step can desync client vs worker assumptions (dt, damping, etc)
-	-- - \\ why: freezing config also keeps profiling consistent because parameters don't drift during runtime
+	-- - \\ copy config once so callers can’t mutate tuning mid-sim and create weird desync behavior
+	-- - \\ this also keeps profiling consistent because parameters don’t drift during runtime
 	local cfg = defaultConfig()
 	if config then
 		for k, v in pairs(config :: any) do
@@ -541,9 +490,8 @@ function ClientBloodSystem.new(config: Config?): BloodSystem
 end
 
 function ClientBloodSystem:_cloneWorkers(): { Actor }
-	-- - \\ cloning locally keeps deployment simple and guarantees sendmessage targets local actors
-	-- - \\ why: sendmessage only works if the actor exists in this client environment; cloning makes it deterministic
-	-- - \\ why: it also decouples the effect from server replication and avoids ordering issues
+	-- - \\ cloning locally keeps deployment simple and guarantees the actors exist in this client environment
+	-- - \\ it also avoids ordering problems where the effect runs before some replicated setup finishes
 	local workersFolder = ReplicatedStorage:WaitForChild(self.Config.WorkersFolderName) :: Folder
 
 	local player = Players.LocalPlayer
@@ -567,9 +515,8 @@ function ClientBloodSystem:_cloneWorkers(): { Actor }
 end
 
 local function popFree(sys: BloodSystem): number?
-	-- - \\ stack pop keeps allocation constant time under spam
-	-- - \\ why: constant time allocation is the only way to guarantee splash spam doesn't become an O(n) stall
-	-- - \\ why: when empty, we return nil and the caller drops particles (the intentional safety valve)
+	-- - \\ stack pop keeps allocation constant-time under spam
+	-- - \\ the “empty” case is intentional: it tells the caller to drop particles instead of doing expensive work
 	local n = #sys._free
 	if n == 0 then
 		return nil
@@ -581,9 +528,8 @@ local function popFree(sys: BloodSystem): number?
 end
 
 local function resolveSpawn(sys: BloodSystem, start: Vector3): Vector3
-	-- - \\ starting inside geometry makes everything worse so we try a cheap overlap based nudge
-	-- - \\ why: if you spawn inside a wall, you immediately trigger sweeps/support flips and spend extra raycasts recovering
-	-- - \\ why: overlap nudge is cheaper than multi-ray "find nearest empty" and is good enough for visuals
+	-- - \\ spawning inside geometry creates extra raycasts and ugly pop-out artifacts
+	-- - \\ a small overlap-based nudge is bounded cost and usually “good enough” for a visual effect
 	local op = sys._op
 	if not op then
 		return start
@@ -592,8 +538,7 @@ local function resolveSpawn(sys: BloodSystem, start: Vector3): Vector3
 	local r = math.max(0.15, sys.Config.CollisionRadius * 0.90)
 
 	local function occupied(p: Vector3): boolean
-		-- - \\ maxparts is one so we get a quick any hit test
-		-- - \\ why: we only need boolean occupancy, not the full set; limiting maxparts keeps it fast and predictable
+		-- - \\ MaxParts=1 gives a cheap “any hit” test instead of building a big list
 		local parts = Workspace:GetPartBoundsInRadius(p, r, op)
 		return parts[1] ~= nil
 	end
@@ -602,8 +547,8 @@ local function resolveSpawn(sys: BloodSystem, start: Vector3): Vector3
 		return start
 	end
 
-	-- - \\ small search that avoids multi ray solutions
-	-- - \\ why: this is intentionally bounded (few offsets, few steps) so it can't blow up cost in degenerate maps
+	-- - \\ bounded search: a few offsets, a few downward steps, then give up
+	-- - \\ the goal isn’t perfect placement, it’s “avoid the worst case” without spiking cost
 	local downStep = 0.25
 	local maxDown = 6.0
 	local lateral = 0.35
@@ -631,27 +576,24 @@ local function resolveSpawn(sys: BloodSystem, start: Vector3): Vector3
 		end
 	end
 
-	-- - \\ downward bias usually looks less weird than shoving sideways
-	-- - \\ why: pushing sideways can visibly teleport out of an impact point; dropping down reads like gravity
+	-- - \\ downward bias usually reads more natural than shoving sideways
 	return start - Vector3.new(0, sys.Config.CollisionRadius, 0)
 end
 
 function ClientBloodSystem:Init()
-	-- - \\ lazy init so we only pay pool allocation when the effect is actually used
-	-- - \\ why: pool creation is an upfront cost; delaying it keeps initial load/menus smoother
-	-- - \\ why: also supports "module exists but never used" without wasting memory
+	-- - \\ lazy init so we only pay pool allocation if the effect is actually used
+	-- - \\ this keeps initial load/menus smoother and avoids wasting memory if nothing ever splashes
 	if self.Initialized then
 		return
 	end
 
 	assert(RunService:IsClient(), "ClientBloodSystem must run on the client")
 
-	-- - \\ state creation is centralized here so the worker can assume the arrays exist
-	-- - \\ why: workers should run hot; they shouldn't build schema or defend nils every step
+	-- - \\ build/reuse state here so workers can assume arrays exist and stay branch-free
 	self._state = getOrCreateState(self.Config.PoolSize)
 
-	-- - \\ cache map and params so per tick work stays mostly math and not allocations
-	-- - \\ why: raycast/overlap params are objects; creating them repeatedly causes allocations and gc pressure
+	-- - \\ cache map + params so the hot path is mostly math, not allocations
+	-- - \\ raycast/overlap params are objects; rebuilding them inside loops creates avoidable churn and gc pressure
 	local mapFolder = Workspace:WaitForChild("MAP")
 	self._map = mapFolder
 
@@ -669,7 +611,7 @@ function ClientBloodSystem:Init()
 	self._op = op
 
 	-- - \\ allocate parts once then reuse by toggling transparency and cframe
-	-- - \\ why: instance churn is the main hitch source; stable pool means stable frametime
+	-- - \\ this is the heart of the “no hitch under spam” design
 	local folder = ensureFolder(self)
 	table.clear(self._parts)
 	table.clear(self._free)
@@ -679,15 +621,13 @@ function ClientBloodSystem:Init()
 		p.Parent = folder
 
 		-- - \\ park far away while hidden so reuse never flashes at origin
-		-- - \\ why: some engines/clients can show a part for a frame during parenting; parking it prevents a visible "pop"
 		p.CFrame = CFrame.new(0, -1e6, 0)
 
 		self._parts[i] = p
 		self._visible[i] = false
 		self._free[i] = i
 
-		-- - \\ keep arrays non nil so workers never branch on missing fields
-		-- - \\ why: pre-filling also defends against partial state if something interrupts init
+		-- - \\ prefill arrays so workers never see nil if something interrupts init
 		self._state.active[i] = 0
 		self._state.phase[i] = 0
 		self._state.age[i] = 0
@@ -696,8 +636,7 @@ function ClientBloodSystem:Init()
 		self._state.wallt[i] = 0
 	end
 
-	-- - \\ actors do the heavy stepping so the main thread can stay focused on rendering
-	-- - \\ why: keeps cframe writes + visibility logic responsive under heavy blood spam
+	-- - \\ actors do the heavy stepping; main thread stays focused on rendering and bookkeeping
 	self._actors = self:_cloneWorkers()
 	self.Initialized = true
 
@@ -719,9 +658,8 @@ function ClientBloodSystem:Init()
 	local supportStep = 1 / math.max(1, self.Config.SupportHz)
 
 	local function updateVisibility()
-		-- - \\ cframe writes are the hot path so we only do them when actually visible
-		-- - \\ why: visibility is the gating signal for "should we spend cframe work"
-		-- - \\ why: we also update transparency here so hidden parts don't cost fillrate or draw calls
+		-- - \\ visibility is the gate that decides if we spend cframe cost
+		-- - \\ cframe writes are expensive, so this function exists mostly to help other code skip work
 		local cam = nowCamera()
 		if not cam then
 			return
@@ -744,8 +682,8 @@ function ClientBloodSystem:Init()
 			if d2 <= camDistSq then
 				local v, onScreen = cam:WorldToViewportPoint(Vector3.new(px, py, pz))
 				if onScreen and v.Z > 0 then
-					-- - \\ margin reduces popping when the camera jitters
-					-- - \\ why: camera shake / headbob can flicker edges; margin gives hysteresis without state machines
+					-- - \\ margin reduces edge popping during small camera jitters/shake
+					-- - \\ it’s cheap hysteresis without keeping extra per-particle state
 					if v.X >= -50 and v.Y >= -50 and v.X <= (vpSize.X + 50) and v.Y <= (vpSize.Y + 50) then
 						vis = true
 					end
@@ -754,24 +692,28 @@ function ClientBloodSystem:Init()
 
 			if self._visible[idx] ~= vis then
 				self._visible[idx] = vis
+
+				-- - \\ transparency flips here so hidden parts stop consuming render cost
+				-- - \\ the simulation continues, but the expensive render-side updates can be gated elsewhere
 				self._parts[idx].Transparency = if vis then 0 else 1
 			end
 		end
 	end
 
 	local function applyVisuals()
-		-- - \\ reclamation happens here because the client owns the pool and the active list
-		-- - \\ why: only the client should decide "free vs active" because it owns parts + the free stack
-		-- - \\ the worker only flips active to zero when it is done
-		-- - \\ why: worker finishing is a single bit write; client does the expensive bookkeeping and instance hiding
+		-- - \\ this runs every frame for two reasons:
+		-- - \\   1) reclamation stays responsive, which refills _free quickly during spam
+		-- - \\   2) visible cframe writes feel tight because they’re synced to RenderStepped
+		-- - \\ workers only flip active=0; the client owns the instance pool and the bookkeeping
 		for i = #self._activeList, 1, -1 do
 			local idx = self._activeList[i]
 
 			if self._state.active[idx] == 0 then
 				local pos = self._activePos[idx]
 				if pos then
-					-- - \\ swap remove keeps removal fast even when a lot die at once
-					-- - \\ why: we avoid table.remove shifting N elements, which spikes when many particles expire together
+					-- - \\ swap-remove avoids shifting the array when lots of particles die together
+					-- - \\ shifting is the kind of “rare spike” that looks fine in normal tests but explodes under spam
+					-- - \\ swap-remove keeps the cost basically constant no matter how many die at once
 					local lastIdx = self._activeList[#self._activeList]
 					self._activeList[pos] = lastIdx
 					self._activePos[lastIdx] = pos
@@ -779,8 +721,8 @@ function ClientBloodSystem:Init()
 					self._activePos[idx] = nil
 				end
 
-				-- - \\ clear flags so the next reuse does not inherit stale contact state
-				-- - \\ why: if you reuse an index with old wall/support flags, the worker may instantly resolve as if colliding
+				-- - \\ clear contact flags so reused slots don’t inherit phantom collisions
+				-- - \\ reuse is common under spam; stale flags are a classic “random bug” source
 				self._state.wall[idx] = 0
 				self._state.wallt[idx] = 0
 				self._state.support[idx] = 0
@@ -790,12 +732,11 @@ function ClientBloodSystem:Init()
 				part.CFrame = CFrame.new(0, -1e6, 0)
 				self._visible[idx] = false
 
-				-- - \\ recycle index back to the pool
-				-- - \\ why: returning to free stack is what keeps future spawn O(1)
+				-- - \\ return idx to the free stack so future spawns stay constant-time
 				self._free[#self._free + 1] = idx
 			else
-				-- - \\ skip cframe writes when hidden because that is where the main thread cost piles up
-				-- - \\ why: worker continues simming so state remains correct, but we avoid paying render-side cost
+				-- - \\ skip cframe writes when hidden; worker still simulates so state stays correct
+				-- - \\ this is where _visible does real work: it prevents the hottest cost from scaling with “active”
 				if self._visible[idx] then
 					local px = self._state.px[idx]
 					local py = self._state.py[idx]
@@ -806,14 +747,13 @@ function ClientBloodSystem:Init()
 
 					local cf: CFrame
 					if phase == 1 then
-						-- - \\ airborne uses free rotation so it reads like spray not stickers
-						-- - \\ why: airborne blobs are "volumetric" visually; arbitrary rotation reads like droplets tumbling
+						-- - \\ airborne gets free rotation so it reads like spray instead of a flat sticker
 						local ax = self._state.ax[idx]
 						local az = self._state.az[idx]
 						cf = CFrame.new(px, py, pz) * CFrame.Angles(ax, ay, az)
 					else
-						-- - \\ grounded aligns to the surface normal so it sits cleanly on slopes
-						-- - \\ why: once landed, viewers expect it to conform to the surface, otherwise it floats/clips
+						-- - \\ grounded aligns to surface normal so it sits cleanly on slopes
+						-- - \\ this also keeps grounded motion visually stable when sliding/settling
 						local nx = self._state.nx[idx]
 						local ny = self._state.ny[idx]
 						local nz = self._state.nz[idx]
@@ -827,9 +767,8 @@ function ClientBloodSystem:Init()
 	end
 
 	local function dispatchPhysics(dt: number, list: { number })
-		-- - \\ split indices evenly across actors so one worker does not become the bottleneck
-		-- - \\ why: even distribution prevents "one hot worker" stalling while others idle
-		-- - \\ why: balancing is more important than perfect chunking because particle cost varies by collisions
+		-- - \\ split indices evenly across actors so one worker doesn’t become the bottleneck
+		-- - \\ cost per particle varies (collisions, support loss, ceiling hits), so simple balancing works well
 		local actors = self._actors
 		local n = #actors
 		if n == 0 then
@@ -851,9 +790,8 @@ function ClientBloodSystem:Init()
 			end
 			local endPos = math.min(activeCount, startPos + per - 1)
 
-			-- - \\ small slice allocation scales with worker count not particle count
-			-- - \\ why: we allocate one slice per worker per dispatch; that is bounded by actor count (small)
-			-- - \\ why: sending a contiguous slice avoids sending huge tables or per-particle messages
+			-- - \\ allocate one slice per worker per dispatch (bounded by worker count, not by particle count)
+			-- - \\ this keeps messaging overhead stable even if activeCount is large
 			local slice = table.create(endPos - startPos + 1)
 			local s = 1
 			for j = startPos, endPos do
@@ -861,9 +799,8 @@ function ClientBloodSystem:Init()
 				s += 1
 			end
 
-			-- - \\ send only what the worker needs so config cannot drift through shared state
-			-- - \\ why: config in message is explicit and versionable; worker doesn't depend on shared mutable config
-			-- - \\ why: less sharedtable traffic (only state arrays mutate), fewer accidental cross-context reads
+			-- - \\ message carries config so workers don’t depend on shared mutable tuning
+			-- - \\ that keeps “state” focused on particle data only, and avoids weird bugs from config drifting mid-step
 			a:SendMessage("Step", {
 				dt = dt,
 				indices = slice,
@@ -885,17 +822,16 @@ function ClientBloodSystem:Init()
 	end
 
 	local function updateSupport(list: { number })
-		-- - \\ support refresh is what lets splats fall off edges instead of hovering on an old plane
-		-- - \\ why: the worker may be using last-known plane normal/point; if the particle drifts over an edge, it must lose support
-		-- - \\ why: we do this on client so workers don't each raycast (would multiply raycast cost by worker count)
+		-- - \\ support refresh prevents “hovering decals” when particles drift off ledges
+		-- - \\ doing it on the client keeps raycast budgets single-sourced instead of multiplying by worker count
 		local rpLocal = self._rp :: RaycastParams
 
 		for i = 1, #list do
 			local idx = list[i]
 			local phase = self._state.phase[idx]
 
-			-- - \\ dead and fully resting do not need support work so we skip to save raycasts
-			-- - \\ why: phase 0 means inactive, phase 3 means "resting" (basically stopped), so support updates give little value
+			-- - \\ inactive/resting don’t benefit from support checks, so skip them
+			-- - \\ this keeps raycast spend focused on particles that might actually transition (air -> slide -> rest)
 			if phase ~= 0 and phase ~= 3 then
 				local px = self._state.px[idx]
 				local py = self._state.py[idx]
@@ -909,6 +845,8 @@ function ClientBloodSystem:Init()
 					local hx, hy, hz = hit.Position.X, hit.Position.Y, hit.Position.Z
 					local nx, ny, nz = hit.Normal.X, hit.Normal.Y, hit.Normal.Z
 
+					-- - \\ worker wants the latest plane info without doing its own raycasts
+					-- - \\ this keeps “what surface am i on” consistent across the pipeline
 					self._state.lx[idx] = hx
 					self._state.ly[idx] = hy
 					self._state.lz[idx] = hz
@@ -921,9 +859,8 @@ function ClientBloodSystem:Init()
 					local dz = pz - hz
 					local sep = dx * nx + dy * ny + dz * nz
 
-					-- - \\ signed separation is a cheap stable way to decide supported without flicker
-					-- - \\ why: projecting distance onto normal gives a consistent "how far above plane" metric
-					-- - \\ why: eps creates hysteresis so small numeric noise doesn't toggle support every tick
+					-- - \\ project onto the normal for a stable “distance above plane” metric
+					-- - \\ eps adds hysteresis so tiny noise doesn’t toggle support every tick
 					self._state.support[idx] = if sep <= (self.Config.SurfaceOffset + self.Config.SupportEps) then 1 else 0
 				else
 					self._state.support[idx] = 0
@@ -933,10 +870,8 @@ function ClientBloodSystem:Init()
 	end
 
 	local function updateWallsBudgeted(list: { number }, dt: number)
-		-- - \\ continuous sweeps prevent tunneling but can get expensive
-		-- - \\ why: discrete collision checks miss thin walls at high speed; sweeps use motion direction to catch first contact
-		-- - \\ budgets keep worst case predictable and we prioritize airborne first since it moves fastest
-		-- - \\ why: airborne is where tunneling looks the worst (droplets pass through walls); sliding is slower and more forgiving
+		-- - \\ sweeps prevent tunneling; budgets keep worst case predictable
+		-- - \\ airborne gets priority because it’s faster and tunneling looks worse there
 		local rpLocal = self._rp :: RaycastParams
 
 		local radius = self.Config.CollisionRadius
@@ -946,8 +881,8 @@ function ClientBloodSystem:Init()
 		local ceilMin = self.Config.CeilingNormalYMin
 
 		local function tryOne(idx: number, phase: number): boolean
-			-- - \\ do not redo a sweep if one already hit this frame
-			-- - \\ why: multiple raycasts for the same particle in the same frame is pure waste; the worker will resolve based on stored toi
+			-- - \\ don’t do multiple sweeps for the same particle in the same frame
+			-- - \\ once a contact is stored, the worker resolves using that, so extra rays here are just wasted budget
 			if self._state.wall[idx] ~= 0 then
 				return false
 			end
@@ -958,8 +893,7 @@ function ClientBloodSystem:Init()
 
 			local sp2 = vx * vx + vy * vy + vz * vz
 			if sp2 <= 0.0025 then
-				-- - \\ low speed does not tunnel so we save the raycast
-				-- - \\ why: raycasts should be reserved for fast movers; slow movers can be handled by simple support logic
+				-- - \\ slow movers rarely tunnel, so save the raycast for cases where it matters
 				return false
 			end
 
@@ -970,8 +904,8 @@ function ClientBloodSystem:Init()
 
 			local len = sp * dt + radius + pad
 			if len > maxLen then
-				-- - \\ hard cap stops one particle from firing huge rays into the map
-				-- - \\ why: if dt spikes or velocity is high, len could become enormous and cost more (and hit unintended geometry)
+				-- - \\ hard cap prevents huge rays during dt spikes or extreme speeds
+				-- - \\ huge rays also tend to “see” geometry you didn’t mean to interact with (across rooms, behind walls)
 				len = maxLen
 			end
 
@@ -991,8 +925,8 @@ function ClientBloodSystem:Init()
 			local isSide = math.abs(nY) < nyMax
 			local isCeil = (phase == 1) and (nY <= -ceilMin)
 
-			-- - \\ floors are handled by support logic so we only care about side walls and ceilings here
-			-- - \\ why: treating floors here would duplicate support work and cause double-resolve jitter
+			-- - \\ floors are handled by support logic; here we only care about side walls and ceilings
+			-- - \\ mixing floor resolution into this path tends to create double-resolve jitter (support says “on floor”, wall says “hit floor”)
 			if not (isSide or isCeil) then
 				return false
 			end
@@ -1011,9 +945,8 @@ function ClientBloodSystem:Init()
 				t = 1
 			end
 
-			-- - \\ store contact and toi so the worker resolves without doing its own raycasts
-			-- - \\ why: one raycast on the client feeds all workers; if each worker raycasted, budgets would multiply
-			-- - \\ why: storing toi lets the worker integrate to contact point deterministically
+			-- - \\ store time-of-impact + contact so workers can resolve without doing their own raycasts
+			-- - \\ this keeps raycast cost single-sourced and budgeted in one place
 			self._state.wall[idx] = 1
 			self._state.wallt[idx] = t
 
@@ -1056,13 +989,14 @@ function ClientBloodSystem:Init()
 	end
 
 	self._conn = RunService.RenderStepped:Connect(function(dt)
-		-- - \\ renderstepped keeps visuals tight and we still decouple stepping with accumulators
-		-- - \\ why: renderstepped is synced to camera; writing cframes here minimizes perceived latency
-		-- - \\ why: accumulators prevent "do everything every frame" and make stepping frequency deterministic
+		-- - \\ order here matters for both feel and cost:
+		-- - \\   - reparent folder first so visuals stay under the correct camera after swaps
+		-- - \\   - cull before visuals so we don’t write cframes for things we’re about to hide
+		-- - \\   - reclaim every frame so _free refills quickly and spam stays smooth
+		-- - \\   - run support/walls before dispatch so workers get the freshest collision hints
 		local cam = nowCamera()
 		if cam and self._folder and self._folder.Parent ~= cam then
-			-- - \\ camera swaps happen so we reparent instead of rebuilding the pool
-			-- - \\ why: rebuilding would re-clone parts and spike; reparent is cheap and preserves pooled instances
+			-- - \\ camera swaps happen; reparent is cheap and avoids rebuilding the pool
 			self._folder.Parent = cam
 		end
 
@@ -1083,9 +1017,8 @@ function ClientBloodSystem:Init()
 		local doRest = physAccumRest >= physStepRest
 
 		if doVis or doHid or doRest then
-			-- - \\ partitioning means we spend raycasts and high rate only on visible particles
-			-- - \\ why: visibility is the best proxy for "does the player benefit from this cost"
-			-- - \\ why: resting particles are almost static; they can be updated rarely without visual loss
+			-- - \\ partitioning keeps expensive work focused on visible particles
+			-- - \\ the point is not “perfect simulation everywhere”, it’s “spend where the player benefits”
 			local visList = table.create(64)
 			local hidList = table.create(64)
 			local restList = table.create(64)
@@ -1107,9 +1040,9 @@ function ClientBloodSystem:Init()
 			end
 
 			if doVis then
-				-- - \\ clamp dt so one hitch does not turn into a huge catch up step
-				-- - \\ why: big dt makes particles teleport and makes sweeps long (more likely to hit odd stuff)
-				-- - \\ why: clamping stabilizes simulation and keeps ray lengths bounded even if the game hitches
+				-- - \\ clamp dt so one hitch doesn’t turn into a huge “catch up” step
+				-- - \\ big dt makes particles teleport, makes sweeps long, and tends to create weird one-frame contacts
+				-- - \\ clamping keeps the sim stable and keeps sweep rays bounded even if the game stutters
 				local stepDt = math.min(physAccumVis, 0.1)
 				physAccumVis = 0
 
@@ -1124,17 +1057,16 @@ function ClientBloodSystem:Init()
 			end
 
 			if doHid then
-				-- - \\ hidden still steps so it does not freeze then pop back in wrong
-				-- - \\ why: if hidden particles pause, when they re-enter view they will appear "stuck in the past"
-				-- - \\ why: lower hz keeps correctness without paying full rate
+				-- - \\ hidden still steps so it doesn’t freeze and then pop back wrong when visible again
+				-- - \\ lower hz is enough to keep “where it should be” correct without paying full rate
 				local stepDt = math.min(physAccumHid, 0.1)
 				physAccumHid = 0
 				dispatchPhysics(stepDt, hidList)
 			end
 
 			if doRest then
-				-- - \\ resting is low motion so low rate is fine and saves a lot of work
-				-- - \\ why: most cost comes from collision + integration; resting does neither much, so low rate is nearly free
+				-- - \\ resting is low motion; low rate saves a lot of work with almost no visual loss
+				-- - \\ this is a big win because resting can become the majority of active particles over time
 				local stepDt = math.min(physAccumRest, 0.1)
 				physAccumRest = 0
 				dispatchPhysics(stepDt, restList)
@@ -1144,8 +1076,7 @@ function ClientBloodSystem:Init()
 end
 
 function ClientBloodSystem:Splash(at: Vector3 | BasePart)
-	-- - \\ callers should not need to care about init order so we self init on first use
-	-- - \\ why: splash is the "public api"; making it safe removes ordering bugs in weapons / effects code
+	-- - \\ public api: make it safe even if the caller doesn’t know init order
 	if not self.Initialized then
 		self:Init()
 	end
@@ -1159,34 +1090,29 @@ function ClientBloodSystem:Splash(at: Vector3 | BasePart)
 
 	local spawnCount = math.random(self.Config.SpawnMin, self.Config.SpawnMax)
 	local folder = ensureFolder(self)
-
 	local rpLocal = self._rp :: RaycastParams
 
 	for _ = 1, spawnCount do
-		-- - \\ if we are saturated we drop particles instead of stalling the client
-		-- - \\ why: when pool is empty, the only alternative is realloc/resize (expensive) or searching (expensive)
-		-- - \\ why: dropping is the chosen failure mode because it's visually acceptable and performance safe
+		-- - \\ if we’re saturated, drop particles instead of stalling the client
+		-- - \\ resizing/scanning here would be the classic “spam makes fps die” bug
 		local idx = popFree(self)
 		if not idx then
 			break
 		end
 
-		-- - \\ tiny jitter makes repeated splashes look less copy paste and helps avoid identical overlaps
-		-- - \\ why: identical positions cause identical ray hits and can stack visually in an unnatural way
-		-- - \\ why: jitter also helps occupancy checks find a nearby free spot instead of hammering the same blocked center
+		-- - \\ small jitter keeps repeated splashes from stacking perfectly and helps the occupancy nudge
+		-- - \\ identical positions tend to create identical ray hits, which makes the effect look copy-pasted
 		local jitter = Vector3.new(
 			(math.random() - 0.5) * 0.25,
 			(math.random() - 0.5) * 0.10,
 			(math.random() - 0.5) * 0.25
 		)
 
-		-- - \\ keep starts out of geometry so collision recovery does not waste a bunch of work
-		-- - \\ why: starting inside means immediate wall hits, more sweeps, and ugly "pop-out" artifacts
+		-- - \\ keep starts out of geometry so collision recovery doesn’t waste work
 		local start = resolveSpawn(self, pos + jitter)
 
-		-- - \\ seed an initial support plane so the first few frames look consistent
-		-- - \\ why: if you wait for the support refresh tick, the particle might render with default normal (0,1,0) and pop orientation later
-		-- - \\ why: one ray here is cheap and improves "first frame" stability a lot
+		-- - \\ seed an initial support plane so the first rendered frames don’t pop orientation later
+		-- - \\ waiting for the next support tick can leave you rendering with a default normal for a moment
 		local upClamp = math.min(self.Config.RaycastUp, math.max(0.25, self.Config.CollisionRadius * 0.55))
 		local origin = start + Vector3.new(0, upClamp, 0)
 		local dir = Vector3.new(0, -(upClamp + self.Config.RaycastDown), 0)
@@ -1200,9 +1126,8 @@ function ClientBloodSystem:Splash(at: Vector3 | BasePart)
 			nx, ny, nz = hit.Normal.X, hit.Normal.Y, hit.Normal.Z
 		end
 
-		-- - \\ random spray is cheap variety without needing per weapon tuning
-		-- - \\ why: you get "organic" variation from simple uniform randomness without authoring curves per gun
-		-- - \\ why: the min/max ranges keep it bounded so droplets don't fly across the entire map
+		-- - \\ random spray gives organic variation without authoring curves per weapon
+		-- - \\ the min/max ranges keep it bounded so droplets don’t fly across the entire map
 		local theta = math.random() * math.pi * 2
 		local out = self.Config.ArchOutMin + (self.Config.ArchOutMax - self.Config.ArchOutMin) * math.random()
 		local up = self.Config.ArchUpMin + (self.Config.ArchUpMax - self.Config.ArchUpMin) * math.random()
@@ -1211,8 +1136,8 @@ function ClientBloodSystem:Splash(at: Vector3 | BasePart)
 		local vz = math.sin(theta) * out
 		local vy = up
 
-		-- - \\ if we still overlap after resolve then bias downward so we do not pop out sideways
-		-- - \\ why: sideways pop reads like teleport and can push through walls; downward bias reads like "it splatted into something"
+		-- - \\ if we still overlap after resolve, bias downward so it reads like a splat instead of a sideways teleport
+		-- - \\ sideways “escape” tends to look like it popped through a wall; downward reads like “hit something and fell”
 		do
 			local op = self._op
 			if op then
@@ -1229,14 +1154,23 @@ function ClientBloodSystem:Splash(at: Vector3 | BasePart)
 			end
 		end
 
-		-- - \\ spin sells the spray and damping handles the settle after landing
-		-- - \\ why: spin provides micro-motion so airborne looks energetic
-		-- - \\ why: damping prevents infinite spin and gives a natural "settle" once grounded
+		-- - \\ spin sells the spray, damping (in the worker) settles it after landing
 		local avx = (math.random() - 0.5) * 30
 		local avy = (math.random() - 0.5) * 44
 		local avz = (math.random() - 0.5) * 30
 
-		self._state.active[idx] = 1
+		-- - \\ write a fully initialized slot before we treat it as active
+		-- - \\ this is the “publish” moment: once active=1, the slot is fair game for every other system
+		-- - \\     - the render loop may read px/py/pz immediately for visibility and cframe
+		-- - \\     - support / wall sweeps can run this tick and expect position + velocity to be coherent
+		-- - \\     - a worker can pick the index up on the next dispatch and integrate right away
+		-- - \\ if we flip active first, anything that runs before the rest of the fields are filled
+		-- - \\ can see half-written state (old values from a recycled slot or zeros) and do the wrong thing
+		-- - \\ a few concrete failures this avoids:
+		-- - \\     - one-frame teleport to an old location because px/pz still held recycled data
+		-- - \\     - a sweep ray starting from the origin because position wasn’t written yet, producing random wall hits
+		-- - \\     - the worker integrating with velocity = 0 for one step, making the droplet hang then snap
+		-- - \\ treating active as a commit flag keeps the rest of the pipeline simple and fast
 		self._state.phase[idx] = 1
 		self._state.age[idx] = 0
 
@@ -1256,9 +1190,8 @@ function ClientBloodSystem:Splash(at: Vector3 | BasePart)
 		self._state.ny[idx] = ny
 		self._state.nz[idx] = nz
 
-		-- - \\ random start orientation keeps repeated splats from looking identical
-		-- - \\ why: if all splats share the same rotation, players notice tiling/patterning immediately
-		-- - \\ why: random orientation is essentially free variety (just 3 numbers) with big visual payoff
+		-- - \\ random start orientation avoids obvious tiling/pattern repetition
+		-- - \\ this is basically free variety: a few numbers that make repeated splashes feel less copy-paste
 		self._state.ax[idx] = math.random() * math.pi * 2
 		self._state.ay[idx] = math.random() * math.pi * 2
 		self._state.az[idx] = math.random() * math.pi * 2
@@ -1267,16 +1200,23 @@ function ClientBloodSystem:Splash(at: Vector3 | BasePart)
 		self._state.avy[idx] = avy
 		self._state.avz[idx] = avz
 
+		-- - \\ clear contact flags so the first worker step starts clean
+		-- - \\ reuse is common; stale wall/support flags are the kind of bug that only shows up under heavy spam
 		self._state.support[idx] = 0
 		self._state.wall[idx] = 0
 		self._state.wallt[idx] = 0
 
-		-- - \\ local tracking keeps iteration fast and lets us do swap removes without touching the pool
-		-- - \\ why: activeList is the tight loop list; pool is capacity-only and should not be scanned
-		-- - \\ why: swap remove needs a position map to stay O(1)
+		-- - \\ publish active last on purpose
+		-- - \\ this makes “active=1” mean “slot is complete and safe to read” for every consumer
+		self._state.active[idx] = 1
+
+		-- - \\ track it locally so the client can iterate only active slots and reclaim with swap-remove
+		-- - \\ the pool is capacity; the active list is the real workload
 		self._activeList[#self._activeList + 1] = idx
 		self._activePos[idx] = #self._activeList
 
+		-- - \\ part stays hidden until visibility sampling marks it visible
+		-- - \\ that keeps “spawn spam” from instantly turning into “cframe spam”
 		self._parts[idx].Parent = folder
 		self._parts[idx].Transparency = 1
 		self._visible[idx] = false
@@ -1285,8 +1225,7 @@ end
 
 function ClientBloodSystem:Destroy()
 	-- - \\ explicit teardown avoids leaked connections and pooled instances during mode switches or reloads
-	-- - \\ why: renderstepped connections keep running even if you think the system is gone; leaks cause hidden perf drain
-	-- - \\ why: pooled parts stick around unless destroyed; during map swaps you want clean reset and memory release
+	-- - \\ renderstepped connections keep running if you forget them, and those leaks become “mystery fps drain”
 	if self._conn then
 		self._conn:Disconnect()
 		self._conn = nil
